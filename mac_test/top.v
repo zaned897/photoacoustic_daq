@@ -1,4 +1,3 @@
-`include "uart_tx.v"
 
 module top (
     input  wire sys_clk,
