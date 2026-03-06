@@ -1,0 +1,23 @@
+# Sistema Operativo (macOS)
+.DS_Store
+
+# Entornos y Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+Pipfile.lock
+
+# Archivos de Síntesis FPGA (Yosys / NextPNR / Gowin)
+build/
+impl/
+*.fs
+*.bit
+*.vcd
+*.json
+*.log
+
+# Configuraciones Locales de IDE
+.vscode/
