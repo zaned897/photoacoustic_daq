@@ -20,8 +20,8 @@ module top (
 
     always @(posedge sys_clk) begin
         if (ram_write_en) begin
-            memory[ptr] <= ptr[7:0]; // 🔹 MODO PRUEBA: Rampa sintética
-            // memory[ptr] <= adc_data; // 🔹 MODO REAL: Sensor (Descomentar)
+            // memory[ptr] <= ptr[7:0]; // 🔹 MODO PRUEBA: Rampa sintética
+            memory[ptr] <= adc_data; // 🔹 MODO REAL: Sensor (Descomentar)
         end
         mem_read_data <= memory[ptr];
     end
