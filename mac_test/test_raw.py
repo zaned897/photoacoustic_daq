@@ -4,7 +4,7 @@ import serial
 
 
 SERIAL_PORT = '/dev/cu.usbserial-101'
-BAUD_RATE = 115200
+BAUD_RATE = 3_000_000   # 3 Mbaud — debe coincidir con uart_tx.v
 
 
 def main() -> None:

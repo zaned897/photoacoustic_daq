@@ -1,35 +1,82 @@
+// =============================================================================
+// PHOTOACOUSTIC DAQ — TANG NANO 9K — ASIGNACIÓN DE PINES
+// =============================================================================
+//
+// Diagrama del header IZQUIERDO (de arriba hacia abajo):
+//
+//   Pos  Pin  Señal            Descripción
+//   ───────────────────────────────────────────────────────────────────────
+//    5   25   adc_data[7]      ADC D11 — MSB (bit 11 del conversor 12-bit)
+//    6   26   adc_data[5]      ADC D9
+//    7   27   adc_data[3]      ADC D7
+//    8   28   adc_data[1]      ADC D5
+//    9   29   [RESERVADO]      ADC D3  — expansión a 10 bits (NO CONECTAR)
+//   10   30   [RESERVADO]      ADC D1  — expansión a 12 bits (NO CONECTAR)
+//   11   33   adc_clk          Reloj del ADC (27 MHz, fase invertida de sys_clk)
+//   12   34   adc_data[6]      ADC D10
+//   13   40   adc_data[4]      ADC D8
+//   14   35   adc_data[2]      ADC D6
+//   15   41   adc_data[0]      ADC D4  — LSB del bus actual (bit 4 del conversor)
+//   16   42   [RESERVADO]      ADC D2  — expansión a 12 bits (NO CONECTAR)
+//   17   51   [RESERVADO]      ADC D0  — expansión a 12 bits (NO CONECTAR)
+//
+// Header DERECHO:
+//   Pin 77  (IOT37A, Bank 2, LVCMOS33) → trigger_rpi
+//
+// NOTA DE INSTALACIÓN: El ADC debe montarse GIRADO 180° respecto al FPGA
+// para que D11 quede en la fila más alta y los cables no se crucen.
+//
+// HOJA DE RUTA DE EXPANSIÓN:
+//   8-bit  (actual)  : D4–D11 conectados, bus adc_data[7:0]
+//   10-bit (próximo) : agregar D3→pin29, D1→pin30, ampliar bus a [9:0]
+//   12-bit (futuro)  : agregar D2→pin42, D0→pin51, ampliar bus a [11:0]
+// =============================================================================
+
 // --- SISTEMA BASE ---
-// Reloj interno (27 MHz)
 IO_LOC "sys_clk" 52;
 IO_PORT "sys_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
-// Asignar el botón S1 físico para el reset
-IO_LOC "sys_rst_n" 4; 
+IO_LOC "sys_rst_n" 4;
 IO_PORT "sys_rst_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
-// Disparo / Trigger (Botón S2 o Láser a 3.3V)
-IO_LOC "trigger_in" 3; 
-IO_PORT "trigger_in" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+// --- TRIGGERS ---
+// Botón S2 físico del Tang Nano 9K.
+// Pull-up interno: reposo = HIGH; botón presionado = LOW.
+// El flanco activo es LOW→HIGH (liberación del botón).
+IO_LOC "trigger_manual" 3;
+IO_PORT "trigger_manual" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
-// UART TX (Hacia la Mac)
+// Tren de pulsos 5 kHz desde Raspberry Pi (GPIO a 3.3V).
+// Pull-down: línea en reposo = LOW; pulso activo = HIGH.
+// El flanco de subida de cada pulso dispara una ventana de captura.
+IO_LOC "trigger_rpi" 77;
+IO_PORT "trigger_rpi" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+// --- UART TX ---
 IO_LOC "uart_tx" 17;
 IO_PORT "uart_tx" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
-// --- FILA INFERIOR DEL ADC (Pines 25-29) ---
-IO_LOC "adc_data[7]" 25; // D11 (MSB)
-IO_LOC "adc_data[5]" 26; // D9
-IO_LOC "adc_data[3]" 27; // D7
-IO_LOC "adc_data[1]" 28; // D5
-IO_LOC "adc_clk"     29; // CLK
+// --- ADC: COLUMNA DERECHA (header izquierdo, posiciones 5–11) ---
+// Pines 29 y 30: NO CONECTAR — reservados para D3 y D1
+IO_LOC "adc_data[7]" 25;    // D11 — MSB
+IO_LOC "adc_data[5]" 26;    // D9
+IO_LOC "adc_data[3]" 27;    // D7
+IO_LOC "adc_data[1]" 28;    // D5
+//                  29       // [RESERVADO] D3 — expansión a 10 bits
+//                  30       // [RESERVADO] D1 — expansión a 12 bits
+IO_LOC "adc_clk"     33;    // CLK del ADC
 
-// --- FILA SUPERIOR DEL ADC (Pines 30-33) ---
-IO_LOC "adc_data[6]" 30; // D10
-IO_LOC "adc_data[4]" 31; // D8
-IO_LOC "adc_data[2]" 32; // D6
-IO_LOC "adc_data[0]" 33; // D4 (LSB)
+// --- ADC: COLUMNA IZQUIERDA (header izquierdo, posiciones 12–15) ---
+// Pines 42 y 51: NO CONECTAR — reservados para D2 y D0
+IO_LOC "adc_data[6]" 34;    // D10
+IO_LOC "adc_data[4]" 40;    // D8
+IO_LOC "adc_data[2]" 35;    // D6
+IO_LOC "adc_data[0]" 41;    // D4 — LSB del bus actual
+//                  42       // [RESERVADO] D2 — expansión a 12 bits
+//                  51       // [RESERVADO] D0 — expansión a 12 bits
 
 // --- CONFIGURACIÓN ELÉCTRICA ADC ---
-IO_PORT "adc_clk" IO_TYPE=LVCMOS33 DRIVE=8;
+IO_PORT "adc_clk"     IO_TYPE=LVCMOS33 DRIVE=8;
 IO_PORT "adc_data[7]" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 IO_PORT "adc_data[6]" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 IO_PORT "adc_data[5]" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
@@ -39,5 +86,8 @@ IO_PORT "adc_data[2]" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 IO_PORT "adc_data[1]" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 IO_PORT "adc_data[0]" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
 
+// --- LED DE ESTADO ---
+// LED activo-bajo en Tang Nano 9K: pin LOW = LED encendido.
+// El módulo top asigna led_busy = LOW cuando state != IDLE.
 IO_LOC "led_busy" 10;
 IO_PORT "led_busy" IO_TYPE=LVCMOS18;

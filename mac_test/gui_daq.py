@@ -7,8 +7,8 @@ from PyQt6.QtCore import QTimer
 
 # --- Constantes ---
 SERIAL_PORT = '/dev/cu.usbserial-101'
-BAUD_RATE = 115200
-SAMPLE_SIZE = 1024
+BAUD_RATE = 3_000_000   # 3 Mbaud — requiere adaptador FTDI (FT232R/FT4232H)
+SAMPLE_SIZE = 1350      # 27 MSPS × 50 µs = 1350 muestras por ráfaga
 FS_MHZ = 27.0
 C_TISSUE = 1540.0
 
