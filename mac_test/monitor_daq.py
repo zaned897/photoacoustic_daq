@@ -296,7 +296,14 @@ class DAQMonitor(QtWidgets.QMainWindow):
 def main() -> None:
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.2)
+        # Bajar el latency timer del FTDI (default 16 ms en macOS/Linux).
+        # Sin esto el driver agrupa datos en chunks grandes y desalinea pares.
+        try:
+            ser.set_low_latency_mode(True)
+        except (NotImplementedError, OSError):
+            pass  # Windows ya respeta la config del Device Manager
         ser.reset_input_buffer()
+        ser.reset_output_buffer()
         print(f"Conectado a: {SERIAL_PORT}")
     except serial.SerialException as error:
         print(f"ERROR de puerto: {error}")
