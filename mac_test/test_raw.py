@@ -1,9 +1,14 @@
+import os
+import sys
 import time
 
 import serial
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from serial_helper import find_uart_port  # noqa: E402
 
-SERIAL_PORT = 'COM14'
+
+SERIAL_PORT = find_uart_port()
 BAUD_RATE = 3_000_000   # 3 Mbaud — debe coincidir con uart_tx.v
 
 

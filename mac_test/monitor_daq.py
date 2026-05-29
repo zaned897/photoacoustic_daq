@@ -18,6 +18,7 @@ Controles del gráfico (nativos de PyQtGraph):
     - Tecla 'A'              : autorrange
 """
 
+import os
 import sys
 import time
 
@@ -26,8 +27,12 @@ import pyqtgraph as pg
 import serial
 from PySide6 import QtCore, QtWidgets
 
+# Permite importar serial_helper cuando el script se ejecuta directamente.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from serial_helper import find_uart_port  # noqa: E402
+
 # --- Configuración ---
-SERIAL_PORT = "COM14"
+SERIAL_PORT = find_uart_port()
 BAUD_RATE = 3_000_000
 SAMPLE_SIZE = 1350  # muestras por ráfaga
 FS_MHZ = 27.0
