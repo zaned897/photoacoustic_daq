@@ -9,10 +9,10 @@
 // los dos canales de trigger, almacena las muestras en Block RAM y las envía
 // al host Python via UART 8N1 a 3 Mbaud.
 //
-//   [IDLE] ──trigger_event──► [CAPTURE: 1350 muestras @ 27 MSPS]
+//   [IDLE] ──trigger_event──► [CAPTURE: 1350 muestras @ 27 MSPS, 10 bits]
 //                                             │ 50 µs
 //                                             ▼
-//                               [SENDING: UART 3 Mbaud, 4.5 ms]
+//                               [SENDING: UART 3 Mbaud, 2 B/muestra → 9 ms]
 //                                             │
 //                                             ▼
 //                                          [IDLE]
@@ -71,11 +71,12 @@ module top (
     output wire                led_busy           // Activo-bajo HW: LED encendido cuando state != IDLE
 );
 
-    // ─── SELECCIÓN DE BITS EFECTIVOS (Fase 1: 8 MSBs del AD9226) ──────────────
-    // Cambiar a adc_data_raw[11:2] para 10 bits o [11:0] para 12 bits.
-    // Atención: pasar a >8 bits requiere ampliar la RAM y el protocolo UART
-    // (2 bytes por muestra), no basta con cambiar esta línea.
-    wire [7:0] adc_data = adc_data_raw[11:4];
+    // ─── SELECCIÓN DE BITS EFECTIVOS (Fase 2: 10 MSBs del AD9226) ─────────────
+    // adc_data_raw[11:2] = D11..D2 → descarta D0 y D1 (los 2 LSBs del 12-bit).
+    // Para volver a 8 bits: usar [11:4], memoria [7:0], y enviar 1 byte/muestra.
+    // Para 12 bits completos: usar [11:0], memoria [11:0], y enviar high con
+    //   {4'b0, mem_read_data[11:8]} en lugar de {6'b0, mem_read_data[9:8]}.
+    wire [9:0] adc_data = adc_data_raw[11:2];
 
     // 27 MSPS × 50 µs = 1350 muestras
     // Cubre señal acústica de 0 a 37.5 mm de profundidad (v_sonido = 1500 m/s)
@@ -101,14 +102,26 @@ module top (
     assign adc_clk = ~sys_clk;
 
     (* ram_style = "block" *)
-    reg [7:0]  memory [0:BURST_SIZE-1];
-    reg [7:0]  mem_read_data;
+    reg [9:0]  memory [0:BURST_SIZE-1];   // 10 bits/muestra (Fase 2)
+    reg [9:0]  mem_read_data;
     reg [10:0] ptr;            // 11 bits: rango 0..2047, cubre BURST_SIZE=1350
     reg        ram_write_en;
+    reg        byte_idx;       // 0=low byte, 1=high byte (para TX 10b en 2B LE)
+
+    // ─── Registro de pipeline para el bus ADC ─────────────────────────────────
+    // Sin esto, el pin D11 (FPGA pin 53, físicamente el último del header) a
+    // veces se leía mal por setup-time insuficiente — el síntoma era valores
+    // ocasionales con bit 9 invertido (ej. 600→88 = diferencia de 512).
+    // El (* IOB = "true" *) le indica al placer que ponga estos flops dentro
+    // del IO cell mismo, eliminando la incertidumbre de la red interna.
+    (* IOB = "true" *) reg [9:0] adc_data_reg;
+    always @(posedge sys_clk) begin
+        adc_data_reg <= adc_data;
+    end
 
     always @(posedge sys_clk) begin
         if (ram_write_en)
-            memory[ptr] <= adc_data;
+            memory[ptr] <= adc_data_reg;   // usa la versión registrada
         mem_read_data <= memory[ptr];
     end
 
@@ -116,7 +129,12 @@ module top (
     // Elimina metaestabilidad para señales asíncronas externas (botón, RPi).
     // trigger_manual: pull-up → reposo HIGH; flanco activo = LOW→HIGH (liberación)
     // trigger_rpi:    pull-down → reposo LOW; flanco activo = LOW→HIGH (pulso RPi)
-    localparam IDLE = 0, CAPTURE = 1, SENDING = 2;
+    // SEND_PREP: 1 ciclo de espera entre CAPTURE y SENDING para que
+    // mem_read_data se cargue con memory[0] antes de empezar a transmitir.
+    // Sin esto, el primer byte enviado era el LOW del sample 1349 (el último
+    // de la captura previa), provocando un desfase de 1 muestra en 8-bit y un
+    // outlier ~88 LSB en 10-bit (par 0 = [low_1349, high_0] → valor inválido).
+    localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2, SENDING = 3;
     reg [1:0] state = IDLE;
 
     reg man_d1, man_d2, rpi_d1, rpi_d2;
@@ -169,6 +187,7 @@ module top (
             ptr          <= 0;
             tx_start     <= 0;
             ram_write_en <= 0;
+            byte_idx     <= 0;
         end else begin
             case (state)
 
@@ -183,24 +202,39 @@ module top (
                     if (ptr == BURST_SIZE - 1) begin
                         ptr          <= 0;
                         ram_write_en <= 0;
-                        state        <= SENDING;
+                        state        <= SEND_PREP;
                     end else begin
                         ptr <= ptr + 1;
                     end
                 end
 
+                // 1 ciclo de gracia: deja que mem_read_data <= memory[0] surta
+                // efecto antes de empezar a enviar bytes en SENDING.
+                SEND_PREP: begin
+                    state <= SENDING;
+                end
+
                 // Mientras se transmite, los nuevos triggers son ignorados.
-                // @ 3 Mbaud: 1350 bytes → 4.5 ms → se pierden ≈22 pulsos de la RPi.
-                // Python acumula ráfagas recibidas (≈220/s) para signal averaging.
+                // @ 3 Mbaud, 10 bits: 1350 muestras × 2 B = 2700 bytes → 9 ms.
+                // Formato por muestra: little-endian uint16 con los 10 bits útiles
+                // en los 10 LSB y los 6 MSB en cero. Python lo lee como '<u2' y
+                // hace mask & 0x3FF si quiere verificar.
                 SENDING: begin
                     ram_write_en <= 0;
                     if (!tx_busy && !tx_start) begin
                         if (ptr == BURST_SIZE) begin
-                            state <= IDLE;
+                            state    <= IDLE;
+                            byte_idx <= 0;
                         end else begin
-                            tx_byte_latch <= mem_read_data;
-                            tx_start      <= 1;
-                            ptr           <= ptr + 1;
+                            if (byte_idx == 1'b0) begin
+                                tx_byte_latch <= mem_read_data[7:0];      // low byte
+                                byte_idx      <= 1'b1;
+                            end else begin
+                                tx_byte_latch <= {6'b0, mem_read_data[9:8]};  // high
+                                byte_idx      <= 1'b0;
+                                ptr           <= ptr + 1;
+                            end
+                            tx_start <= 1;
                         end
                     end else begin
                         tx_start <= 0;

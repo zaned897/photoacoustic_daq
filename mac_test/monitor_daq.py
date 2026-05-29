@@ -17,6 +17,7 @@ Controles del gráfico (nativos de PyQtGraph):
     - Click derecho          : menú (autorrange, exportar, etc.)
     - Tecla 'A'              : autorrange
 """
+
 import sys
 import time
 
@@ -26,11 +27,13 @@ import serial
 from PySide6 import QtCore, QtWidgets
 
 # --- Configuración ---
-SERIAL_PORT = 'COM14'
+SERIAL_PORT = "COM14"
 BAUD_RATE = 3_000_000
-SAMPLE_SIZE = 1350
+SAMPLE_SIZE = 1350  # muestras por ráfaga
 FS_MHZ = 27.0
-BIT_DEPTH = 8
+BIT_DEPTH = 10  # Fase 2: D11..D2 del AD9226
+BYTES_PER_SAMPLE = 2  # 10 bits empaquetados en uint16 LE
+FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # = 2700 bytes/ráfaga
 C_TISSUE = 1540.0
 F_SENSOR = 2.0
 
@@ -40,7 +43,7 @@ TIME_AXIS = np.linspace(0, SAMPLE_SIZE * PERIOD_US, SAMPLE_SIZE)
 DIST_AXIS_CM = TIME_AXIS * 1e-6 * C_TISSUE * 100
 LAMBDA_MM = (C_TISSUE / (F_SENSOR * 1e6)) * 1000
 MAX_DEPTH_CM = DIST_AXIS_CM[-1]
-ADC_MAX = (1 << BIT_DEPTH) - 1
+ADC_MAX = (1 << BIT_DEPTH) - 1  # 1023 para 10 bits
 
 
 class SerialReader(QtCore.QThread):
@@ -53,28 +56,34 @@ class SerialReader(QtCore.QThread):
     Si el puerto se pierde (USB desconectado), emite `error` con el
     mensaje y termina el thread.
     """
+
     frame_ready = QtCore.Signal(np.ndarray)
     error = QtCore.Signal(str)
 
-    def __init__(self, ser: serial.Serial, parent: QtCore.QObject | None = None) -> None:
+    def __init__(
+        self, ser: serial.Serial, parent: QtCore.QObject | None = None
+    ) -> None:
         super().__init__(parent)
         self.ser = ser
         self._running = True
 
     def run(self) -> None:
-        # ser.read(SAMPLE_SIZE) bloquea hasta tener los bytes o timeout.
+        # ser.read(FRAME_BYTES) bloquea hasta tener los bytes o timeout.
         # Como timeout=0.2 s en setup_serial(), el peor caso es 200 ms de
         # bloqueo si el FPGA no dispara (no afecta a la UI: estamos en thread).
         while self._running:
             try:
-                raw = self.ser.read(SAMPLE_SIZE)
-                if len(raw) < SAMPLE_SIZE:
+                raw = self.ser.read(FRAME_BYTES)
+                if len(raw) < FRAME_BYTES:
                     # Timeout sin datos suficientes: seguimos esperando.
                     continue
                 # Drenado: si hay más frames ya esperando, salta al más reciente.
-                while self.ser.in_waiting >= SAMPLE_SIZE:
-                    raw = self.ser.read(SAMPLE_SIZE)
-                data = np.frombuffer(raw, dtype=np.uint8)
+                while self.ser.in_waiting >= FRAME_BYTES:
+                    raw = self.ser.read(FRAME_BYTES)
+                # 10 bits empaquetados en uint16 little-endian.
+                # Los 6 MSB son cero, así que no hace falta mask explícito,
+                # pero lo aplicamos por seguridad ante cualquier glitch.
+                data = np.frombuffer(raw, dtype="<u2") & 0x03FF
                 self.frame_ready.emit(data)
             except serial.SerialException as e:
                 self.error.emit(str(e))
@@ -106,23 +115,23 @@ class DAQMonitor(QtWidgets.QMainWindow):
         # --- Panel izquierdo: gráfico ---
         pg.setConfigOptions(antialias=True, useOpenGL=True)
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setBackground('#0f172a')
+        self.plot_widget.setBackground("#0f172a")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
-        self.plot_widget.setLabel('bottom', 'Time of Flight', units='µs')
-        self.plot_widget.setLabel('left', 'Amplitude (ADC LSB)')
+        self.plot_widget.setLabel("bottom", "Time of Flight", units="µs")
+        self.plot_widget.setLabel("left", "Amplitude (ADC LSB)")
         self.plot_widget.setYRange(-5, ADC_MAX + 5)
         self.plot_widget.setXRange(0, TIME_AXIS[-1])
 
         # Eje superior con profundidad
-        top_axis = pg.AxisItem('top')
-        top_axis.setLabel('Depth in Tissue', units='cm', color='#f39c12')
+        top_axis = pg.AxisItem("top")
+        top_axis.setLabel("Depth in Tissue", units="cm", color="#f39c12")
         top_axis.setScale(C_TISSUE * 1e-4)  # µs → cm
-        self.plot_widget.setAxisItems({'top': top_axis})
+        self.plot_widget.setAxisItems({"top": top_axis})
 
         self.curve = self.plot_widget.plot(
             TIME_AXIS,
             np.zeros(SAMPLE_SIZE),
-            pen=pg.mkPen('#00f2ff', width=1),
+            pen=pg.mkPen("#00f2ff", width=1),
         )
         layout.addWidget(self.plot_widget, stretch=4)
 
@@ -152,9 +161,7 @@ class DAQMonitor(QtWidgets.QMainWindow):
 
         right.addSpacing(15)
         status_title = QtWidgets.QLabel("REAL-TIME STATUS")
-        status_title.setStyleSheet(
-            "color:#4ade80; font-size:13px; font-weight:bold;"
-        )
+        status_title.setStyleSheet("color:#4ade80; font-size:13px; font-weight:bold;")
         right.addWidget(status_title)
 
         self.lbl_fps = QtWidgets.QLabel("FPS:        --")
@@ -190,6 +197,23 @@ class DAQMonitor(QtWidgets.QMainWindow):
 
     @QtCore.Slot(np.ndarray)
     def on_frame(self, data: np.ndarray) -> None:
+        # ─── Workaround: reemplazar outliers exactos a 0 con interp. lineal ───
+        # Hay un sample fijo (típicamente índice 64) que sale 0 consistentemente.
+        # Causa pendiente de investigar (FPGA SENDING o FTDI USB framing).
+        # Como es 1/1350 muestras (0.07%) y siempre en el mismo lugar, lo
+        # tapamos para no contaminar la visualización ni las stats.
+        zero_idx = np.where(data == 0)[0]
+        if len(zero_idx) > 0:
+            # Diagnóstico: imprime los índices afectados cada 50 frames
+            if self.frame_count % 50 == 0:
+                print(f"  ↳ ceros en índices: {zero_idx.tolist()}")
+            # Interpolar: data[i] <- promedio de vecinos válidos
+            data = data.copy()  # frombuffer da array read-only
+            for i in zero_idx:
+                left = data[i - 1] if i > 0 else data[i + 1]
+                right = data[i + 1] if i < len(data) - 1 else data[i - 1]
+                data[i] = (int(left) + int(right)) // 2
+
         self.curve.setData(TIME_AXIS, data)
 
         now = time.time()
@@ -250,7 +274,9 @@ class DAQMonitor(QtWidgets.QMainWindow):
             "color:#ef4444; font-family:Consolas,monospace; "
             "font-size:12px; font-weight:bold;"
         )
-        print(f"\nUSB perdido: {message}\nReconecta el Tang Nano y reinicia el programa.")
+        print(
+            f"\nUSB perdido: {message}\nReconecta el Tang Nano y reinicia el programa."
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         # Pedimos al thread que termine y esperamos a que cierre limpio
@@ -277,5 +303,5 @@ def main() -> None:
     sys.exit(app.exec())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
