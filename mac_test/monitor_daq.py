@@ -76,6 +76,10 @@ class SerialReader(QtCore.QThread):
         # ser.read(FRAME_BYTES) bloquea hasta tener los bytes o timeout.
         # Como timeout=0.2 s en setup_serial(), el peor caso es 200 ms de
         # bloqueo si el FPGA no dispara (no afecta a la UI: estamos en thread).
+        # Throttle de emits: cap a 30 Hz para evitar saturar la cola de
+        # signals de Qt cuando hay backlog en el buffer del OS.
+        MIN_EMIT_INTERVAL = 1.0 / 30
+        last_emit = 0.0
         while self._running:
             try:
                 raw = self.ser.read(FRAME_BYTES)
@@ -85,6 +89,11 @@ class SerialReader(QtCore.QThread):
                 # Drenado: si hay más frames ya esperando, salta al más reciente.
                 while self.ser.in_waiting >= FRAME_BYTES:
                     raw = self.ser.read(FRAME_BYTES)
+                now = time.monotonic()
+                if now - last_emit < MIN_EMIT_INTERVAL:
+                    # Saltamos este frame para no inundar la UI.
+                    continue
+                last_emit = now
                 # 10 bits empaquetados en uint16 little-endian.
                 # Los 6 MSB son cero, así que no hace falta mask explícito,
                 # pero lo aplicamos por seguridad ante cualquier glitch.
@@ -118,7 +127,11 @@ class DAQMonitor(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(central)
 
         # --- Panel izquierdo: gráfico ---
-        pg.setConfigOptions(antialias=True, useOpenGL=True)
+        # OpenGL deshabilitado en macOS (Apple deprecó OpenGL y el backend
+        # de PyQtGraph se cuelga en Sequoia/Sonoma). En Windows/Linux
+        # OpenGL sí acelera bien.
+        use_opengl = sys.platform != "darwin"
+        pg.setConfigOptions(antialias=True, useOpenGL=use_opengl)
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("#0f172a")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
