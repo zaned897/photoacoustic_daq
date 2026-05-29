@@ -1,195 +1,233 @@
+"""
+PHOTOACOUSTIC DAQ — Monitor en tiempo real con PyQtGraph.
+
+Reescrito desde matplotlib para alcanzar >100 FPS reales con ráfagas de
+1350 muestras @ 27 MSPS. PyQtGraph usa Qt + OpenGL bajo el capó.
+
+Controles del gráfico (nativos de PyQtGraph):
+    - Rueda del mouse        : zoom
+    - Click derecho + arrastrar : zoom rectangular
+    - Click izq. + arrastrar : pan
+    - Click derecho          : menú (autorrange, exportar, etc.)
+    - Tecla 'A'              : autorrange
+"""
+import sys
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
+import pyqtgraph as pg
 import serial
-from matplotlib.animation import FuncAnimation
-from mpl_toolkits.axes_grid1.inset_locator import mark_inset
+from PySide6 import QtCore, QtWidgets
 
-
-# --- Configuración Constantes ---
-SERIAL_PORT = '/dev/cu.usbserial-101'
-BAUD_RATE = 3_000_000   # 3 Mbaud — requiere adaptador FTDI (FT232R/FT4232H)
-SAMPLE_SIZE = 1350      # 27 MSPS × 50 µs = 1350 muestras por ráfaga
+# --- Configuración ---
+SERIAL_PORT = 'COM14'
+BAUD_RATE = 3_000_000
+SAMPLE_SIZE = 1350
 FS_MHZ = 27.0
 BIT_DEPTH = 8
 C_TISSUE = 1540.0
-F_SENSOR = 2.0          # Sensor ultrasónico fotoacústico (MHz)
+F_SENSOR = 2.0
 
-# --- Cálculos Derivados ---
+# --- Derivados ---
 PERIOD_US = 1.0 / FS_MHZ
 TIME_AXIS = np.linspace(0, SAMPLE_SIZE * PERIOD_US, SAMPLE_SIZE)
-DIST_AXIS = (TIME_AXIS * 1e-6 * C_TISSUE) * 100
+DIST_AXIS_CM = TIME_AXIS * 1e-6 * C_TISSUE * 100
 LAMBDA_MM = (C_TISSUE / (F_SENSOR * 1e6)) * 1000
-MAX_DEPTH_CM = DIST_AXIS[-1]
+MAX_DEPTH_CM = DIST_AXIS_CM[-1]
+ADC_MAX = (1 << BIT_DEPTH) - 1
 
 
-def setup_serial() -> serial.Serial:
-    """Configura y retorna la conexión serial."""
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
-        ser.reset_input_buffer()
-        print(f"✅ Conectado a: {SERIAL_PORT}")
-        return ser
-    except serial.SerialException as error:
-        print(f"❌ ERROR: {error}")
-        exit(1)
+class DAQMonitor(QtWidgets.QMainWindow):
+    def __init__(self, ser: serial.Serial) -> None:
+        super().__init__()
+        self.ser = ser
+        self.last_time = time.time()
+        self.fps_smoothed = 0.0
+        self.frame_count = 0
 
+        self.setWindowTitle("Photoacoustic DAQ — Live Monitor (PyQtGraph)")
+        self.resize(1300, 720)
 
-def time_to_dist(time_val: float) -> float:
-    """Convierte microsegundos a centímetros de profundidad."""
-    return time_val * 1e-6 * C_TISSUE * 100
+        # --- Layout principal ---
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QHBoxLayout(central)
 
+        # --- Panel izquierdo: gráfico ---
+        pg.setConfigOptions(antialias=True, useOpenGL=True)
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground('#0f172a')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_widget.setLabel('bottom', 'Time of Flight', units='µs')
+        self.plot_widget.setLabel('left', 'Amplitude (ADC LSB)')
+        self.plot_widget.setYRange(-5, ADC_MAX + 5)
+        self.plot_widget.setXRange(0, TIME_AXIS[-1])
 
-def dist_to_time(dist_val: float) -> float:
-    """Convierte centímetros de profundidad a microsegundos."""
-    return dist_val / (C_TISSUE * 100) * 1e6
+        # Eje superior con profundidad
+        top_axis = pg.AxisItem('top')
+        top_axis.setLabel('Depth in Tissue', units='cm', color='#f39c12')
+        top_axis.setScale(C_TISSUE * 1e-4)  # µs → cm
+        self.plot_widget.setAxisItems({'top': top_axis})
+
+        self.curve = self.plot_widget.plot(
+            TIME_AXIS,
+            np.zeros(SAMPLE_SIZE),
+            pen=pg.mkPen('#00f2ff', width=1),
+        )
+        layout.addWidget(self.plot_widget, stretch=4)
+
+        # --- Panel derecho: métricas ---
+        right = QtWidgets.QVBoxLayout()
+        right.setSpacing(8)
+
+        title = QtWidgets.QLabel("PHOTOACOUSTIC DAQ")
+        title.setStyleSheet("color:#4ade80; font-size:18px; font-weight:bold;")
+        right.addWidget(title)
+
+        physics = QtWidgets.QLabel(
+            f"Sound Speed : {C_TISSUE:.0f} m/s\n"
+            f"Transducer  : {F_SENSOR} MHz\n"
+            f"Wavelength  : {LAMBDA_MM:.3f} mm\n"
+            f"Theo. Res.  : {LAMBDA_MM/2:.3f} mm\n"
+            f"Max Depth   : {MAX_DEPTH_CM:.2f} cm\n"
+            f"Time Window : {TIME_AXIS[-1]:.1f} µs\n"
+            f"Sampling    : {FS_MHZ} MSPS\n"
+            f"Bit Depth   : {BIT_DEPTH} bits"
+        )
+        physics.setStyleSheet(
+            "color:#bdc3c7; font-family:Consolas,monospace; font-size:11px; "
+            "background:#1e293b; padding:10px; border-radius:6px;"
+        )
+        right.addWidget(physics)
+
+        right.addSpacing(15)
+        status_title = QtWidgets.QLabel("REAL-TIME STATUS")
+        status_title.setStyleSheet(
+            "color:#4ade80; font-size:13px; font-weight:bold;"
+        )
+        right.addWidget(status_title)
+
+        self.lbl_fps = QtWidgets.QLabel("FPS:        --")
+        self.lbl_rate = QtWidgets.QLabel("Throughput: -- kB/s")
+        self.lbl_minmax = QtWidgets.QLabel("Min/Max:    --/--")
+        self.lbl_mean = QtWidgets.QLabel("Mean:       --")
+        self.lbl_status = QtWidgets.QLabel("Signal:     WAITING")
+
+        for lbl in (
+            self.lbl_fps,
+            self.lbl_rate,
+            self.lbl_minmax,
+            self.lbl_mean,
+            self.lbl_status,
+        ):
+            lbl.setStyleSheet(
+                "color:white; font-family:Consolas,monospace; font-size:12px;"
+            )
+            right.addWidget(lbl)
+
+        right.addStretch()
+
+        right_widget = QtWidgets.QWidget()
+        right_widget.setLayout(right)
+        right_widget.setFixedWidth(280)
+        layout.addWidget(right_widget)
+
+        # --- Timer de polling del puerto ---
+        # 1 ms: cae bajo el peor caso de llegada (cada ~5 ms entre disparos
+        # consecutivos a 5 kHz si la RPi está conectada). Cuando hay datos los
+        # absorbemos en bloque; cuando no, in_waiting devuelve 0 sin coste.
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.poll_serial)
+        self.timer.start(1)
+
+    def poll_serial(self) -> None:
+        try:
+            if self.ser.in_waiting < SAMPLE_SIZE:
+                return
+            raw = self.ser.read(SAMPLE_SIZE)
+            # Drenar buffer: si vienen apilados varios frames, nos quedamos
+            # con el más reciente para que la gráfica no se atrase.
+            while self.ser.in_waiting >= SAMPLE_SIZE:
+                raw = self.ser.read(SAMPLE_SIZE)
+        except serial.SerialException as e:
+            self.timer.stop()
+            self.lbl_status.setText("Signal:     [X] USB DESCONECTADO")
+            self.lbl_status.setStyleSheet(
+                "color:#ef4444; font-family:Consolas,monospace; "
+                "font-size:12px; font-weight:bold;"
+            )
+            print(f"\nUSB perdido: {e}\nReconecta el Tang Nano y reinicia el programa.")
+            return
+        data = np.frombuffer(raw, dtype=np.uint8)
+        self.curve.setData(TIME_AXIS, data)
+
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+        if dt > 0:
+            fps = 1.0 / dt
+            self.fps_smoothed = 0.9 * self.fps_smoothed + 0.1 * fps
+            kbps = SAMPLE_SIZE * self.fps_smoothed / 1000.0
+            self.lbl_fps.setText(f"FPS:        {self.fps_smoothed:5.1f}")
+            self.lbl_rate.setText(f"Throughput: {kbps:5.1f} kB/s")
+
+        d_min = int(data.min())
+        d_max = int(data.max())
+        d_mean = float(data.mean())
+        d_pp = d_max - d_min
+        d_std = float(data.std())
+
+        self.lbl_minmax.setText(f"Min/Max:    {d_min}/{d_max}")
+        self.lbl_mean.setText(f"Mean:       {d_mean:6.2f}")
+
+        # Log a consola: 1 línea por captura — útil para caracterizar entrada
+        self.frame_count += 1
+        print(
+            f"#{self.frame_count:5d}  "
+            f"min={d_min:3d}  max={d_max:3d}  pp={d_pp:3d}  "
+            f"mean={d_mean:6.2f}  std={d_std:5.2f}  "
+            f"fps={self.fps_smoothed:5.1f}"
+        )
+
+        if d_max - d_min < 5:
+            self.lbl_status.setText("Signal:     [!] FLAT / NO SIGNAL")
+            self.lbl_status.setStyleSheet(
+                "color:#ef4444; font-family:Consolas,monospace; "
+                "font-size:12px; font-weight:bold;"
+            )
+        elif d_max >= ADC_MAX - 1 or d_min <= 1:
+            self.lbl_status.setText("Signal:     [!] SATURATED")
+            self.lbl_status.setStyleSheet(
+                "color:#f59e0b; font-family:Consolas,monospace; "
+                "font-size:12px; font-weight:bold;"
+            )
+        else:
+            self.lbl_status.setText("Signal:     [OK] VALID")
+            self.lbl_status.setStyleSheet(
+                "color:#4ade80; font-family:Consolas,monospace; "
+                "font-size:12px; font-weight:bold;"
+            )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self.timer.stop()
+        if self.ser.is_open:
+            self.ser.close()
+        super().closeEvent(event)
 
 
 def main() -> None:
-    """Punto de entrada principal para la visualización del DAQ."""
-    ser = setup_serial()
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.2)
+        ser.reset_input_buffer()
+        print(f"Conectado a: {SERIAL_PORT}")
+    except serial.SerialException as error:
+        print(f"ERROR de puerto: {error}")
+        sys.exit(1)
 
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(13, 7))
-    plt.subplots_adjust(right=0.70, top=0.85, bottom=0.15)
-
-    fig.suptitle(
-        "PHOTOACOUSTIC DAQ | PROTOTYPE v1",
-        fontsize=18,
-        fontweight='bold',
-        color='#4ade80'
-    )
-    ax.set_title(
-        f"Sensor: {F_SENSOR} MHz | Sampling: {FS_MHZ} MSPS | "
-        f"Window: {MAX_DEPTH_CM:.2f} cm",
-        fontsize=10,
-        color='gray'
-    )
-
-    ax.set_xlabel(r"Time of Flight ($\mu s$)", fontsize=12, color='#bdc3c7')
-    ax.set_ylabel("Amplitude (ADC LSB)", fontsize=12, color='#bdc3c7')
-    ax.set_ylim(-10, 300)
-    ax.set_xlim(0, max(TIME_AXIS))
-    ax.grid(True, which='both', linestyle='--', alpha=0.2)
-
-    ax_top = ax.secondary_xaxis('top')
-    ax_top.set_functions((time_to_dist, dist_to_time))
-    ax_top.set_xlabel('Depth in Tissue (cm)', fontsize=11, color='#f39c12')
-    ax_top.tick_params(axis='x', colors='#f39c12')
-
-    line_main, = ax.plot([], [], color='#00f2ff', linewidth=1.0, label='Data')
-
-    axins = ax.inset_axes([0.55, 0.55, 0.40, 0.40])
-    axins.set_facecolor('#0f172a')
-    axins.grid(True, linestyle=':', color='gray', alpha=0.3)
-    line_zoom, = axins.plot(
-        [], [], color='#ff0055', linewidth=1.5, marker='o', markersize=3
-    )
-
-    zoom_start = 10.0
-    zoom_width = 2.0
-    axins.set_xlim(zoom_start, zoom_start + zoom_width)
-    axins.set_ylim(-5, 260)
-    axins.set_title(
-        f"ROI Zoom ({zoom_start}-{zoom_start+zoom_width} $\mu s$)",
-        fontsize=9,
-        color='#ff0055'
-    )
-
-    mark_inset(ax, axins, loc1=2, loc2=4, fc="none", ec="0.5", linestyle="--")
-
-    col_x = 0.73
-    fig.text(
-        col_x, 0.88, "PHYSICS METRICS",
-        fontsize=12, fontweight='bold', color='white'
-    )
-    fig.text(
-        col_x, 0.875, "______________",
-        fontsize=12, fontweight='bold', color='#4ade80'
-    )
-
-    props = dict(boxstyle='round', facecolor='#1e293b', alpha=0.8)
-    info_text = (
-        f"Sound Speed: {C_TISSUE:.0f} m/s\n"
-        f"Transducer:  {F_SENSOR} MHz\n"
-        f"Wavelength:  {LAMBDA_MM:.3f} mm\n"
-        f"Theo. Res.:  {LAMBDA_MM/2:.3f} mm\n"
-        f"Max Depth:   {MAX_DEPTH_CM:.2f} cm\n"
-        f"Time Win:    {TIME_AXIS[-1]:.1f} $\mu s$"
-    )
-    fig.text(
-        col_x, 0.70, info_text,
-        fontsize=10, family='monospace', color='#bdc3c7', bbox=props
-    )
-
-    fig.text(
-        col_x, 0.60, "REAL-TIME STATUS",
-        fontsize=12, fontweight='bold', color='white'
-    )
-    fig.text(
-        col_x, 0.595, "________________",
-        fontsize=12, fontweight='bold', color='#4ade80'
-    )
-
-    t_fps = fig.text(
-        col_x, 0.55, "FPS:     --",
-        fontsize=11, family='monospace', color='white'
-    )
-    t_rate = fig.text(
-        col_x, 0.52, "Through: -- kB/s",
-        fontsize=11, family='monospace', color='white'
-    )
-    t_check = fig.text(
-        col_x, 0.48, "Signal:  WAITING",
-        fontsize=10, fontweight='bold', color='gray'
-    )
-
-    state = {'last_time': time.time()}
-
-    def update(_frame: int) -> tuple:
-        if ser.in_waiting >= SAMPLE_SIZE:
-            try:
-                raw = ser.read(SAMPLE_SIZE)
-                data = np.array(list(raw))
-
-                line_main.set_data(TIME_AXIS, data)
-                line_zoom.set_data(TIME_AXIS, data)
-
-                curr_time = time.time()
-                dt_val = curr_time - state['last_time']
-                if dt_val > 0:
-                    fps = 1.0 / dt_val
-                    kbps = (SAMPLE_SIZE * fps) / 1000.0
-                else:
-                    fps = 0.0
-                    kbps = 0.0
-                state['last_time'] = curr_time
-
-                diffs = np.diff(data)
-                errors = np.sum((diffs != 1) & (diffs != -255))
-
-                t_fps.set_text(f"FPS:     {fps:4.1f}")
-                t_rate.set_text(f"Through: {kbps:4.1f} kB/s")
-
-                if errors <= 10:
-                    t_check.set_text("[OK] SIGNAL VALID")
-                    t_check.set_color('#4ade80')
-                else:
-                    t_check.set_text("[!] NOISY / LOSS")
-                    t_check.set_color('#ef4444')
-
-                ser.reset_input_buffer()
-            except Exception:
-                pass
-
-        return line_main, line_zoom
-
-    _ani = FuncAnimation(
-        fig, update, interval=1, blit=False, cache_frame_data=False
-    )
-    plt.show()
-    ser.close()
+    app = QtWidgets.QApplication(sys.argv)
+    window = DAQMonitor(ser)
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':

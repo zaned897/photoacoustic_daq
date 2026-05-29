@@ -3,7 +3,7 @@ import time
 import serial
 
 
-SERIAL_PORT = '/dev/cu.usbserial-101'
+SERIAL_PORT = 'COM14'
 BAUD_RATE = 3_000_000   # 3 Mbaud — debe coincidir con uart_tx.v
 
 

@@ -41,28 +41,58 @@
 //   en el pico. Solo puede medirse presencia/energía, NO la forma de onda.
 //   Para caracterizar la forma del pulso se requiere ≥100 MSPS.
 //
-// EXPANSIÓN A 10/12 BITS
-// ──────────────────────
-//   adc_data[7:0] = D11:D4 del ADC (8 MSBs del conversor de 12 bits).
-//   Los pines FPGA 29, 30, 42, 51 están reservados para D3, D1, D2, D0.
-//   Expansión futura: ampliar bus a [9:0] (10-bit) o [11:0] (12-bit)
-//   y añadir cables a los pines reservados. Ver pins.cst.
+// EXPANSIÓN A 10/12 BITS — CABLEADO FIJO, SOLO SE EDITA HDL
+// ─────────────────────────────────────────────────────────
+//   El bus físico adc_data_raw[11:0] llega completo al FPGA (los 12 pines
+//   D0–D11 están cableados, ver pins.cst). En Fase 1 solo usamos los 8 MSBs
+//   para mantener el protocolo UART de 1 byte/muestra. Los bits no usados
+//   se sintetizan como entradas en alta impedancia (pull-down) y se descartan.
+//
+//   Fase 1 (actual) : ADC_WIDTH = 8  → wire [7:0] adc_sample = adc_data_raw[11:4]
+//   Fase 2 (10-bit) : ADC_WIDTH = 10 → empaquetar 2 bytes/muestra en UART
+//   Fase 3 (12-bit) : ADC_WIDTH = 12 → idem 2 bytes/muestra
+//
+//   También está cableado adc_otr (pin 51). En Fase 1 se ignora; en el futuro
+//   puede usarse para marcar ráfagas saturadas y descartarlas en Python.
 // =============================================================================
 
 module top (
-    input  wire        sys_clk,
-    input  wire        sys_rst_n,
-    input  wire        trigger_manual,  // Botón S2 — pull-up, flanco activo en liberación
-    input  wire        trigger_rpi,     // Tren de pulsos 5 kHz desde RPi (activo-alto)
-    input  wire [7:0]  adc_data,        // D11:D4 del ADC (8 MSBs del conversor de 12 bits)
-    output wire        adc_clk,         // Reloj del ADC — fase invertida de sys_clk
-    output wire        uart_tx,
-    output wire        led_busy         // Activo-bajo HW: LED encendido cuando state != IDLE
+    input  wire                sys_clk,
+    input  wire                sys_rst_n,
+    input  wire                trigger_manual,    // Botón S2 — pull-up, flanco activo en liberación
+    input  wire                trigger_rpi,       // Tren de pulsos 5 kHz desde RPi (activo-alto)
+    // (* keep *) evita que Yosys optimice los bits que no se usan en Fase 1
+    // (bits 0..3 del bus). Sin esto, nextpnr falla al aplicar IO_LOC en pins.cst
+    // porque los puertos físicos quedarían fuera de la netlist sintetizada.
+    (* keep = "true" *) input  wire [11:0] adc_data_raw,  // Bus físico completo D11..D0 del AD9226
+    (* keep = "true" *) input  wire        adc_otr,       // Out-of-Range del AD9226 (sin uso F1)
+    output wire                adc_clk,           // Reloj del ADC — fase invertida de sys_clk
+    output wire                uart_tx,
+    output wire                led_busy           // Activo-bajo HW: LED encendido cuando state != IDLE
 );
+
+    // ─── SELECCIÓN DE BITS EFECTIVOS (Fase 1: 8 MSBs del AD9226) ──────────────
+    // Cambiar a adc_data_raw[11:2] para 10 bits o [11:0] para 12 bits.
+    // Atención: pasar a >8 bits requiere ampliar la RAM y el protocolo UART
+    // (2 bytes por muestra), no basta con cambiar esta línea.
+    wire [7:0] adc_data = adc_data_raw[11:4];
 
     // 27 MSPS × 50 µs = 1350 muestras
     // Cubre señal acústica de 0 a 37.5 mm de profundidad (v_sonido = 1500 m/s)
     parameter BURST_SIZE = 1350;
+
+    // ─── AUTO-TRIGGER INTERNO ────────────────────────────────────────────────
+    // Genera un trigger periódico sin necesidad de S2 o trigger_rpi externo.
+    // Útil para monitoreo continuo (ej. caracterizar un potenciómetro a 50 Hz).
+    // Poner AUTO_TRIGGER_HZ = 0 para desactivar (vuelve al comportamiento
+    // original: solo trigger por S2 o por pulso externo en pin 77).
+    //
+    //   50 Hz → ventana de 20 ms → 15.5 ms libres entre capturas
+    //   10 Hz → ventana de 100 ms → 95.5 ms libres
+    //   100 Hz → ventana de 10 ms → 5.5 ms libres (límite cercano al TX UART)
+    parameter AUTO_TRIGGER_HZ = 50;
+    localparam [25:0] AUTO_TRIG_MAX =
+        (AUTO_TRIGGER_HZ == 0) ? 26'h3FFFFFF : (27_000_000 / AUTO_TRIGGER_HZ - 1);
 
     // El ADC muestrea en el flanco de subida de adc_clk.
     // adc_clk = ~sys_clk: el ADC captura en el flanco de BAJADA de sys_clk.
@@ -93,7 +123,24 @@ module top (
 
     wire manual_posedge = man_d1 && !man_d2;
     wire rpi_posedge    = rpi_d1 && !rpi_d2;
-    wire trigger_event  = manual_posedge | rpi_posedge;
+
+    // Contador del auto-trigger interno (ver parámetro AUTO_TRIGGER_HZ arriba).
+    reg [25:0] auto_trig_cnt = 0;
+    reg        auto_trig_pulse = 0;
+
+    always @(posedge sys_clk) begin
+        auto_trig_pulse <= 0;
+        if (AUTO_TRIGGER_HZ != 0) begin
+            if (auto_trig_cnt >= AUTO_TRIG_MAX) begin
+                auto_trig_cnt   <= 0;
+                auto_trig_pulse <= 1;
+            end else begin
+                auto_trig_cnt <= auto_trig_cnt + 1;
+            end
+        end
+    end
+
+    wire trigger_event = manual_posedge | rpi_posedge | auto_trig_pulse;
 
     always @(posedge sys_clk) begin
         man_d1 <= trigger_manual;
