@@ -4,6 +4,12 @@ PHOTOACOUSTIC DAQ — Monitor en tiempo real con PyQtGraph.
 Reescrito desde matplotlib para alcanzar >100 FPS reales con ráfagas de
 1350 muestras @ 27 MSPS. PyQtGraph usa Qt + OpenGL bajo el capó.
 
+Arquitectura de threading:
+- SerialReader (QThread): bloquea en ser.read(), drena buffer apilado,
+  emite un Signal con la última muestra completa.
+- DAQMonitor (UI thread): solo recibe el Signal y redibuja. Nunca toca
+  el puerto serie directamente → cero contención GIL/UI ↔ I/O.
+
 Controles del gráfico (nativos de PyQtGraph):
     - Rueda del mouse        : zoom
     - Click derecho + arrastrar : zoom rectangular
@@ -35,6 +41,50 @@ DIST_AXIS_CM = TIME_AXIS * 1e-6 * C_TISSUE * 100
 LAMBDA_MM = (C_TISSUE / (F_SENSOR * 1e6)) * 1000
 MAX_DEPTH_CM = DIST_AXIS_CM[-1]
 ADC_MAX = (1 << BIT_DEPTH) - 1
+
+
+class SerialReader(QtCore.QThread):
+    """Lee ráfagas del puerto serie en un thread dedicado.
+
+    Emite `frame_ready` con la muestra más reciente cuando completa
+    SAMPLE_SIZE bytes. Drena automáticamente cualquier backlog para que
+    la UI nunca trabaje con datos viejos.
+
+    Si el puerto se pierde (USB desconectado), emite `error` con el
+    mensaje y termina el thread.
+    """
+    frame_ready = QtCore.Signal(np.ndarray)
+    error = QtCore.Signal(str)
+
+    def __init__(self, ser: serial.Serial, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self.ser = ser
+        self._running = True
+
+    def run(self) -> None:
+        # ser.read(SAMPLE_SIZE) bloquea hasta tener los bytes o timeout.
+        # Como timeout=0.2 s en setup_serial(), el peor caso es 200 ms de
+        # bloqueo si el FPGA no dispara (no afecta a la UI: estamos en thread).
+        while self._running:
+            try:
+                raw = self.ser.read(SAMPLE_SIZE)
+                if len(raw) < SAMPLE_SIZE:
+                    # Timeout sin datos suficientes: seguimos esperando.
+                    continue
+                # Drenado: si hay más frames ya esperando, salta al más reciente.
+                while self.ser.in_waiting >= SAMPLE_SIZE:
+                    raw = self.ser.read(SAMPLE_SIZE)
+                data = np.frombuffer(raw, dtype=np.uint8)
+                self.frame_ready.emit(data)
+            except serial.SerialException as e:
+                self.error.emit(str(e))
+                break
+            except Exception as e:  # noqa: BLE001
+                self.error.emit(f"Unexpected: {e}")
+                break
+
+    def stop(self) -> None:
+        self._running = False
 
 
 class DAQMonitor(QtWidgets.QMainWindow):
@@ -132,33 +182,14 @@ class DAQMonitor(QtWidgets.QMainWindow):
         right_widget.setFixedWidth(280)
         layout.addWidget(right_widget)
 
-        # --- Timer de polling del puerto ---
-        # 1 ms: cae bajo el peor caso de llegada (cada ~5 ms entre disparos
-        # consecutivos a 5 kHz si la RPi está conectada). Cuando hay datos los
-        # absorbemos en bloque; cuando no, in_waiting devuelve 0 sin coste.
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.poll_serial)
-        self.timer.start(1)
+        # --- Thread de I/O ---
+        self.reader = SerialReader(self.ser)
+        self.reader.frame_ready.connect(self.on_frame)
+        self.reader.error.connect(self.on_error)
+        self.reader.start(QtCore.QThread.Priority.HighPriority)
 
-    def poll_serial(self) -> None:
-        try:
-            if self.ser.in_waiting < SAMPLE_SIZE:
-                return
-            raw = self.ser.read(SAMPLE_SIZE)
-            # Drenar buffer: si vienen apilados varios frames, nos quedamos
-            # con el más reciente para que la gráfica no se atrase.
-            while self.ser.in_waiting >= SAMPLE_SIZE:
-                raw = self.ser.read(SAMPLE_SIZE)
-        except serial.SerialException as e:
-            self.timer.stop()
-            self.lbl_status.setText("Signal:     [X] USB DESCONECTADO")
-            self.lbl_status.setStyleSheet(
-                "color:#ef4444; font-family:Consolas,monospace; "
-                "font-size:12px; font-weight:bold;"
-            )
-            print(f"\nUSB perdido: {e}\nReconecta el Tang Nano y reinicia el programa.")
-            return
-        data = np.frombuffer(raw, dtype=np.uint8)
+    @QtCore.Slot(np.ndarray)
+    def on_frame(self, data: np.ndarray) -> None:
         self.curve.setData(TIME_AXIS, data)
 
         now = time.time()
@@ -180,14 +211,18 @@ class DAQMonitor(QtWidgets.QMainWindow):
         self.lbl_minmax.setText(f"Min/Max:    {d_min}/{d_max}")
         self.lbl_mean.setText(f"Mean:       {d_mean:6.2f}")
 
-        # Log a consola: 1 línea por captura — útil para caracterizar entrada
+        # Log a consola throttled: 1 de cada CONSOLE_EVERY frames.
+        # A 50 FPS imprimiendo cada frame, la consola de Windows bloquea
+        # el event loop de Qt → congelamientos periódicos en la gráfica.
         self.frame_count += 1
-        print(
-            f"#{self.frame_count:5d}  "
-            f"min={d_min:3d}  max={d_max:3d}  pp={d_pp:3d}  "
-            f"mean={d_mean:6.2f}  std={d_std:5.2f}  "
-            f"fps={self.fps_smoothed:5.1f}"
-        )
+        CONSOLE_EVERY = 10
+        if self.frame_count % CONSOLE_EVERY == 0:
+            print(
+                f"#{self.frame_count:5d}  "
+                f"min={d_min:3d}  max={d_max:3d}  pp={d_pp:3d}  "
+                f"mean={d_mean:6.2f}  std={d_std:5.2f}  "
+                f"fps={self.fps_smoothed:5.1f}"
+            )
 
         if d_max - d_min < 5:
             self.lbl_status.setText("Signal:     [!] FLAT / NO SIGNAL")
@@ -208,8 +243,20 @@ class DAQMonitor(QtWidgets.QMainWindow):
                 "font-size:12px; font-weight:bold;"
             )
 
+    @QtCore.Slot(str)
+    def on_error(self, message: str) -> None:
+        self.lbl_status.setText("Signal:     [X] USB DESCONECTADO")
+        self.lbl_status.setStyleSheet(
+            "color:#ef4444; font-family:Consolas,monospace; "
+            "font-size:12px; font-weight:bold;"
+        )
+        print(f"\nUSB perdido: {message}\nReconecta el Tang Nano y reinicia el programa.")
+
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        self.timer.stop()
+        # Pedimos al thread que termine y esperamos a que cierre limpio
+        # antes de cerrar el puerto serie (evita race con un read() en vuelo).
+        self.reader.stop()
+        self.reader.wait(1000)  # ms
         if self.ser.is_open:
             self.ser.close()
         super().closeEvent(event)

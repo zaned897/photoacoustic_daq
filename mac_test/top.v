@@ -90,7 +90,7 @@ module top (
     //   50 Hz → ventana de 20 ms → 15.5 ms libres entre capturas
     //   10 Hz → ventana de 100 ms → 95.5 ms libres
     //   100 Hz → ventana de 10 ms → 5.5 ms libres (límite cercano al TX UART)
-    parameter AUTO_TRIGGER_HZ = 50;
+    parameter AUTO_TRIGGER_HZ = 20;
     localparam [25:0] AUTO_TRIG_MAX =
         (AUTO_TRIGGER_HZ == 0) ? 26'h3FFFFFF : (27_000_000 / AUTO_TRIGGER_HZ - 1);
 
@@ -140,7 +140,13 @@ module top (
         end
     end
 
-    wire trigger_event = manual_posedge | rpi_posedge | auto_trig_pulse;
+    // NOTA: trigger_rpi temporalmente deshabilitado porque el pin 77 capta
+    // ruido capacitivo del bus ADC (líneas D0..D11 conmutando a 27 MHz a pocos
+    // mm del pin) y dispara triggers espurios → FSM se queda en CAPTURE/SENDING
+    // continuamente → satura el USB → Python no alcanza → plot congelado.
+    // Para reactivar: agregar pull-down externo de 10kΩ entre pin 77 y GND.
+    wire trigger_event = manual_posedge | auto_trig_pulse;
+    /* verilator lint_off UNUSED */ wire _unused_rpi = rpi_posedge; /* verilator lint_on UNUSED */
 
     always @(posedge sys_clk) begin
         man_d1 <= trigger_manual;
