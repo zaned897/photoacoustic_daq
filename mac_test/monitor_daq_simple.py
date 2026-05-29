@@ -35,6 +35,7 @@ FS_MHZ = 27.0
 BIT_DEPTH = 10
 BYTES_PER_SAMPLE = 2
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # 2700
+FRAME_HEADER = b"\xAA\x55\xAA\x55"  # sync preamble (debe coincidir con top.v)
 C_TISSUE = 1540.0
 F_SENSOR = 2.0
 
@@ -113,23 +114,38 @@ def main() -> None:
         "fps_smoothed": 0.0,
     }
 
+    HDR_LEN = len(FRAME_HEADER)
+    MAX_BUFFER = 100_000
+
     def update(_frame):
-        # Patrón acumulador (como en monitor_daq.py)
+        # Acumulador + búsqueda de header de sync
         pending = ser.in_waiting
         if pending:
             state["buffer"].extend(ser.read(pending))
 
-        if len(state["buffer"]) < FRAME_BYTES:
+        buf = state["buffer"]
+
+        # Cap de seguridad
+        if len(buf) > MAX_BUFFER:
+            del buf[: -(HDR_LEN - 1)]
+
+        # Busca el último header completo + frame disponible (descarta backlog)
+        latest_frame = None
+        while True:
+            idx = buf.find(FRAME_HEADER)
+            if idx < 0:
+                break
+            if idx > 0:
+                del buf[:idx]
+            if len(buf) < HDR_LEN + FRAME_BYTES:
+                break
+            latest_frame = bytes(buf[HDR_LEN : HDR_LEN + FRAME_BYTES])
+            del buf[: HDR_LEN + FRAME_BYTES]
+
+        if latest_frame is None:
             return (line, status)
 
-        # Procesa solo el frame más reciente; descarta backlog.
-        while len(state["buffer"]) >= 2 * FRAME_BYTES:
-            del state["buffer"][:FRAME_BYTES]
-
-        frame_bytes = bytes(state["buffer"][:FRAME_BYTES])
-        del state["buffer"][:FRAME_BYTES]
-
-        data = (np.frombuffer(frame_bytes, dtype="<u2") & 0x03FF).astype(np.int32)
+        data = (np.frombuffer(latest_frame, dtype="<u2") & 0x03FF).astype(np.int32)
 
         # Interpolar outliers a 0
         zero_idx = np.where(data == 0)[0]

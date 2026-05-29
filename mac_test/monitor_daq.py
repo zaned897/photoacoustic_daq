@@ -39,6 +39,7 @@ FS_MHZ = 27.0
 BIT_DEPTH = 10  # Fase 2: D11..D2 del AD9226
 BYTES_PER_SAMPLE = 2  # 10 bits empaquetados en uint16 LE
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # = 2700 bytes/ráfaga
+FRAME_HEADER = b"\xAA\x55\xAA\x55"  # preámbulo de sync — debe coincidir con top.v
 C_TISSUE = 1540.0
 F_SENSOR = 2.0
 
@@ -73,26 +74,25 @@ class SerialReader(QtCore.QThread):
         self._running = True
 
     def run(self) -> None:
-        # Patrón acumulador: lee lo que esté disponible y mantiene un buffer
-        # interno. Cuando hay FRAME_BYTES bytes acumulados emite un frame.
-        # Esto evita el problema de macOS donde el FTDI entrega chunks de
-        # ~1020 bytes en lugar de 2700, y ser.read(2700) bloqueaba indefinido.
+        # Patrón acumulador + búsqueda de header: lee lo que esté disponible
+        # y busca el preámbulo FRAME_HEADER (0xAA 0x55 0xAA 0x55) que el FPGA
+        # inserta antes de cada ráfaga. Cualquier byte basura/desfasado se
+        # descarta automáticamente al no coincidir con el patrón.
         MIN_EMIT_INTERVAL = 1.0 / 30  # 30 Hz max emits
+        HDR_LEN = len(FRAME_HEADER)
+        MAX_BUFFER = 100_000  # cap de seguridad: si no aparece header, recortar
         last_emit = 0.0
         buffer = bytearray()
-        print(f"[reader] thread iniciado, esperando {FRAME_BYTES} bytes/frame")
+        print(f"[reader] thread iniciado, buscando header {FRAME_HEADER.hex()}")
         loop_count = 0
         while self._running:
             try:
-                # Lee lo que haya disponible. Si nada, espera 1 byte (bloquea
-                # corto, max timeout).
                 pending = self.ser.in_waiting
                 to_read = pending if pending > 0 else 1
                 chunk = self.ser.read(to_read)
                 if chunk:
                     buffer.extend(chunk)
 
-                # Heartbeat cada ~1000 iteraciones (para debug si se cuelga)
                 loop_count += 1
                 if loop_count % 5000 == 0:
                     print(
@@ -100,14 +100,30 @@ class SerialReader(QtCore.QThread):
                         f"in_waiting={self.ser.in_waiting}"
                     )
 
-                # Procesa todos los frames completos que haya en el buffer.
-                while len(buffer) >= FRAME_BYTES:
-                    frame_bytes = bytes(buffer[:FRAME_BYTES])
-                    del buffer[:FRAME_BYTES]
+                # Cap de seguridad: si el header nunca aparece, no acumular sin fin.
+                if len(buffer) > MAX_BUFFER:
+                    # Mantener solo los últimos HDR_LEN-1 bytes por si el
+                    # header está parcial al final.
+                    del buffer[: -(HDR_LEN - 1)]
+
+                # Procesa todos los frames disponibles
+                while True:
+                    idx = buffer.find(FRAME_HEADER)
+                    if idx < 0:
+                        break  # no hay header completo aún
+                    # Descarta basura previa al header
+                    if idx > 0:
+                        del buffer[:idx]
+                    # ¿Hay header + frame completo?
+                    if len(buffer) < HDR_LEN + FRAME_BYTES:
+                        break
+                    # Extrae frame
+                    frame_bytes = bytes(buffer[HDR_LEN : HDR_LEN + FRAME_BYTES])
+                    del buffer[: HDR_LEN + FRAME_BYTES]
 
                     now = time.monotonic()
                     if now - last_emit < MIN_EMIT_INTERVAL:
-                        continue  # throttle: descarta este frame
+                        continue
                     last_emit = now
 
                     data = np.frombuffer(frame_bytes, dtype="<u2") & 0x03FF

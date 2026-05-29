@@ -131,11 +131,15 @@ module top (
     // trigger_rpi:    pull-down → reposo LOW; flanco activo = LOW→HIGH (pulso RPi)
     // SEND_PREP: 1 ciclo de espera entre CAPTURE y SENDING para que
     // mem_read_data se cargue con memory[0] antes de empezar a transmitir.
-    // Sin esto, el primer byte enviado era el LOW del sample 1349 (el último
-    // de la captura previa), provocando un desfase de 1 muestra en 8-bit y un
-    // outlier ~88 LSB en 10-bit (par 0 = [low_1349, high_0] → valor inválido).
-    localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2, SENDING = 3;
-    reg [1:0] state = IDLE;
+    // SEND_HEADER: envía 4 bytes de preámbulo 0xAA 0x55 0xAA 0x55 antes
+    // de los datos. Python escanea ese patrón para resincronizarse en cada
+    // ráfaga — necesario porque Mac/Linux entregan chunks irregulares y sin
+    // framing un solo byte perdido desfasa todas las muestras 10-bit en
+    // pares low/high.
+    localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2,
+               SEND_HEADER = 3, SENDING = 4;
+    reg [2:0] state = IDLE;
+    reg [2:0] header_idx;       // 0..4 (4 bytes a enviar)
 
     reg man_d1, man_d2, rpi_d1, rpi_d2;
 
@@ -188,6 +192,7 @@ module top (
             tx_start     <= 0;
             ram_write_en <= 0;
             byte_idx     <= 0;
+            header_idx   <= 0;
         end else begin
             case (state)
 
@@ -209,9 +214,33 @@ module top (
                 end
 
                 // 1 ciclo de gracia: deja que mem_read_data <= memory[0] surta
-                // efecto antes de empezar a enviar bytes en SENDING.
+                // efecto antes de empezar a enviar bytes en SEND_HEADER.
                 SEND_PREP: begin
-                    state <= SENDING;
+                    state      <= SEND_HEADER;
+                    header_idx <= 0;
+                end
+
+                // Envía los 4 bytes del preámbulo de sincronización:
+                // 0xAA 0x55 0xAA 0x55 — alternancia 1010/0101 fácil de
+                // detectar y poco probable de aparecer en datos válidos
+                // (sample 10-bit válido nunca tiene high byte > 0x03).
+                SEND_HEADER: begin
+                    if (!tx_busy && !tx_start) begin
+                        if (header_idx == 3'd4) begin
+                            state <= SENDING;
+                        end else begin
+                            case (header_idx[1:0])
+                                2'd0: tx_byte_latch <= 8'hAA;
+                                2'd1: tx_byte_latch <= 8'h55;
+                                2'd2: tx_byte_latch <= 8'hAA;
+                                2'd3: tx_byte_latch <= 8'h55;
+                            endcase
+                            header_idx <= header_idx + 1;
+                            tx_start   <= 1;
+                        end
+                    end else begin
+                        tx_start <= 0;
+                    end
                 end
 
                 // Mientras se transmite, los nuevos triggers son ignorados.
