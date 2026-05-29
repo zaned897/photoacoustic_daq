@@ -9,10 +9,10 @@
 // los dos canales de trigger, almacena las muestras en Block RAM y las envía
 // al host Python via UART 8N1 a 3 Mbaud.
 //
-//   [IDLE] ──trigger_event──► [CAPTURE: 1350 muestras @ 27 MSPS]
+//   [IDLE] ──trigger_event──► [CAPTURE: 1350 muestras @ 27 MSPS, 10 bits]
 //                                             │ 50 µs
 //                                             ▼
-//                               [SENDING: UART 3 Mbaud, 4.5 ms]
+//                               [SENDING: UART 3 Mbaud, 2 B/muestra → 9 ms]
 //                                             │
 //                                             ▼
 //                                          [IDLE]
@@ -41,28 +41,59 @@
 //   en el pico. Solo puede medirse presencia/energía, NO la forma de onda.
 //   Para caracterizar la forma del pulso se requiere ≥100 MSPS.
 //
-// EXPANSIÓN A 10/12 BITS
-// ──────────────────────
-//   adc_data[7:0] = D11:D4 del ADC (8 MSBs del conversor de 12 bits).
-//   Los pines FPGA 29, 30, 42, 51 están reservados para D3, D1, D2, D0.
-//   Expansión futura: ampliar bus a [9:0] (10-bit) o [11:0] (12-bit)
-//   y añadir cables a los pines reservados. Ver pins.cst.
+// EXPANSIÓN A 10/12 BITS — CABLEADO FIJO, SOLO SE EDITA HDL
+// ─────────────────────────────────────────────────────────
+//   El bus físico adc_data_raw[11:0] llega completo al FPGA (los 12 pines
+//   D0–D11 están cableados, ver pins.cst). En Fase 1 solo usamos los 8 MSBs
+//   para mantener el protocolo UART de 1 byte/muestra. Los bits no usados
+//   se sintetizan como entradas en alta impedancia (pull-down) y se descartan.
+//
+//   Fase 1 (actual) : ADC_WIDTH = 8  → wire [7:0] adc_sample = adc_data_raw[11:4]
+//   Fase 2 (10-bit) : ADC_WIDTH = 10 → empaquetar 2 bytes/muestra en UART
+//   Fase 3 (12-bit) : ADC_WIDTH = 12 → idem 2 bytes/muestra
+//
+//   También está cableado adc_otr (pin 51). En Fase 1 se ignora; en el futuro
+//   puede usarse para marcar ráfagas saturadas y descartarlas en Python.
 // =============================================================================
 
 module top (
-    input  wire        sys_clk,
-    input  wire        sys_rst_n,
-    input  wire        trigger_manual,  // Botón S2 — pull-up, flanco activo en liberación
-    input  wire        trigger_rpi,     // Tren de pulsos 5 kHz desde RPi (activo-alto)
-    input  wire [7:0]  adc_data,        // D11:D4 del ADC (8 MSBs del conversor de 12 bits)
-    output wire        adc_clk,         // Reloj del ADC — fase invertida de sys_clk
-    output wire        uart_tx,
-    output wire        led_busy         // Activo-bajo HW: LED encendido cuando state != IDLE
+    input  wire                sys_clk,
+    input  wire                sys_rst_n,
+    input  wire                trigger_manual,    // Botón S2 — pull-up, flanco activo en liberación
+    input  wire                trigger_rpi,       // Tren de pulsos 5 kHz desde RPi (activo-alto)
+    // (* keep *) evita que Yosys optimice los bits que no se usan en Fase 1
+    // (bits 0..3 del bus). Sin esto, nextpnr falla al aplicar IO_LOC en pins.cst
+    // porque los puertos físicos quedarían fuera de la netlist sintetizada.
+    (* keep = "true" *) input  wire [11:0] adc_data_raw,  // Bus físico completo D11..D0 del AD9226
+    (* keep = "true" *) input  wire        adc_otr,       // Out-of-Range del AD9226 (sin uso F1)
+    output wire                adc_clk,           // Reloj del ADC — fase invertida de sys_clk
+    output wire                uart_tx,
+    output wire                led_busy           // Activo-bajo HW: LED encendido cuando state != IDLE
 );
+
+    // ─── SELECCIÓN DE BITS EFECTIVOS (Fase 2: 10 MSBs del AD9226) ─────────────
+    // adc_data_raw[11:2] = D11..D2 → descarta D0 y D1 (los 2 LSBs del 12-bit).
+    // Para volver a 8 bits: usar [11:4], memoria [7:0], y enviar 1 byte/muestra.
+    // Para 12 bits completos: usar [11:0], memoria [11:0], y enviar high con
+    //   {4'b0, mem_read_data[11:8]} en lugar de {6'b0, mem_read_data[9:8]}.
+    wire [9:0] adc_data = adc_data_raw[11:2];
 
     // 27 MSPS × 50 µs = 1350 muestras
     // Cubre señal acústica de 0 a 37.5 mm de profundidad (v_sonido = 1500 m/s)
     parameter BURST_SIZE = 1350;
+
+    // ─── AUTO-TRIGGER INTERNO ────────────────────────────────────────────────
+    // Genera un trigger periódico sin necesidad de S2 o trigger_rpi externo.
+    // Útil para monitoreo continuo (ej. caracterizar un potenciómetro a 50 Hz).
+    // Poner AUTO_TRIGGER_HZ = 0 para desactivar (vuelve al comportamiento
+    // original: solo trigger por S2 o por pulso externo en pin 77).
+    //
+    //   50 Hz → ventana de 20 ms → 15.5 ms libres entre capturas
+    //   10 Hz → ventana de 100 ms → 95.5 ms libres
+    //   100 Hz → ventana de 10 ms → 5.5 ms libres (límite cercano al TX UART)
+    parameter AUTO_TRIGGER_HZ = 20;
+    localparam [25:0] AUTO_TRIG_MAX =
+        (AUTO_TRIGGER_HZ == 0) ? 26'h3FFFFFF : (27_000_000 / AUTO_TRIGGER_HZ - 1);
 
     // El ADC muestrea en el flanco de subida de adc_clk.
     // adc_clk = ~sys_clk: el ADC captura en el flanco de BAJADA de sys_clk.
@@ -71,14 +102,26 @@ module top (
     assign adc_clk = ~sys_clk;
 
     (* ram_style = "block" *)
-    reg [7:0]  memory [0:BURST_SIZE-1];
-    reg [7:0]  mem_read_data;
+    reg [9:0]  memory [0:BURST_SIZE-1];   // 10 bits/muestra (Fase 2)
+    reg [9:0]  mem_read_data;
     reg [10:0] ptr;            // 11 bits: rango 0..2047, cubre BURST_SIZE=1350
     reg        ram_write_en;
+    reg        byte_idx;       // 0=low byte, 1=high byte (para TX 10b en 2B LE)
+
+    // ─── Registro de pipeline para el bus ADC ─────────────────────────────────
+    // Sin esto, el pin D11 (FPGA pin 53, físicamente el último del header) a
+    // veces se leía mal por setup-time insuficiente — el síntoma era valores
+    // ocasionales con bit 9 invertido (ej. 600→88 = diferencia de 512).
+    // El (* IOB = "true" *) le indica al placer que ponga estos flops dentro
+    // del IO cell mismo, eliminando la incertidumbre de la red interna.
+    (* IOB = "true" *) reg [9:0] adc_data_reg;
+    always @(posedge sys_clk) begin
+        adc_data_reg <= adc_data;
+    end
 
     always @(posedge sys_clk) begin
         if (ram_write_en)
-            memory[ptr] <= adc_data;
+            memory[ptr] <= adc_data_reg;   // usa la versión registrada
         mem_read_data <= memory[ptr];
     end
 
@@ -86,14 +129,42 @@ module top (
     // Elimina metaestabilidad para señales asíncronas externas (botón, RPi).
     // trigger_manual: pull-up → reposo HIGH; flanco activo = LOW→HIGH (liberación)
     // trigger_rpi:    pull-down → reposo LOW; flanco activo = LOW→HIGH (pulso RPi)
-    localparam IDLE = 0, CAPTURE = 1, SENDING = 2;
+    // SEND_PREP: 1 ciclo de espera entre CAPTURE y SENDING para que
+    // mem_read_data se cargue con memory[0] antes de empezar a transmitir.
+    // Sin esto, el primer byte enviado era el LOW del sample 1349 (el último
+    // de la captura previa), provocando un desfase de 1 muestra en 8-bit y un
+    // outlier ~88 LSB en 10-bit (par 0 = [low_1349, high_0] → valor inválido).
+    localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2, SENDING = 3;
     reg [1:0] state = IDLE;
 
     reg man_d1, man_d2, rpi_d1, rpi_d2;
 
     wire manual_posedge = man_d1 && !man_d2;
     wire rpi_posedge    = rpi_d1 && !rpi_d2;
-    wire trigger_event  = manual_posedge | rpi_posedge;
+
+    // Contador del auto-trigger interno (ver parámetro AUTO_TRIGGER_HZ arriba).
+    reg [25:0] auto_trig_cnt = 0;
+    reg        auto_trig_pulse = 0;
+
+    always @(posedge sys_clk) begin
+        auto_trig_pulse <= 0;
+        if (AUTO_TRIGGER_HZ != 0) begin
+            if (auto_trig_cnt >= AUTO_TRIG_MAX) begin
+                auto_trig_cnt   <= 0;
+                auto_trig_pulse <= 1;
+            end else begin
+                auto_trig_cnt <= auto_trig_cnt + 1;
+            end
+        end
+    end
+
+    // NOTA: trigger_rpi temporalmente deshabilitado porque el pin 77 capta
+    // ruido capacitivo del bus ADC (líneas D0..D11 conmutando a 27 MHz a pocos
+    // mm del pin) y dispara triggers espurios → FSM se queda en CAPTURE/SENDING
+    // continuamente → satura el USB → Python no alcanza → plot congelado.
+    // Para reactivar: agregar pull-down externo de 10kΩ entre pin 77 y GND.
+    wire trigger_event = manual_posedge | auto_trig_pulse;
+    /* verilator lint_off UNUSED */ wire _unused_rpi = rpi_posedge; /* verilator lint_on UNUSED */
 
     always @(posedge sys_clk) begin
         man_d1 <= trigger_manual;
@@ -116,6 +187,7 @@ module top (
             ptr          <= 0;
             tx_start     <= 0;
             ram_write_en <= 0;
+            byte_idx     <= 0;
         end else begin
             case (state)
 
@@ -130,24 +202,39 @@ module top (
                     if (ptr == BURST_SIZE - 1) begin
                         ptr          <= 0;
                         ram_write_en <= 0;
-                        state        <= SENDING;
+                        state        <= SEND_PREP;
                     end else begin
                         ptr <= ptr + 1;
                     end
                 end
 
+                // 1 ciclo de gracia: deja que mem_read_data <= memory[0] surta
+                // efecto antes de empezar a enviar bytes en SENDING.
+                SEND_PREP: begin
+                    state <= SENDING;
+                end
+
                 // Mientras se transmite, los nuevos triggers son ignorados.
-                // @ 3 Mbaud: 1350 bytes → 4.5 ms → se pierden ≈22 pulsos de la RPi.
-                // Python acumula ráfagas recibidas (≈220/s) para signal averaging.
+                // @ 3 Mbaud, 10 bits: 1350 muestras × 2 B = 2700 bytes → 9 ms.
+                // Formato por muestra: little-endian uint16 con los 10 bits útiles
+                // en los 10 LSB y los 6 MSB en cero. Python lo lee como '<u2' y
+                // hace mask & 0x3FF si quiere verificar.
                 SENDING: begin
                     ram_write_en <= 0;
                     if (!tx_busy && !tx_start) begin
                         if (ptr == BURST_SIZE) begin
-                            state <= IDLE;
+                            state    <= IDLE;
+                            byte_idx <= 0;
                         end else begin
-                            tx_byte_latch <= mem_read_data;
-                            tx_start      <= 1;
-                            ptr           <= ptr + 1;
+                            if (byte_idx == 1'b0) begin
+                                tx_byte_latch <= mem_read_data[7:0];      // low byte
+                                byte_idx      <= 1'b1;
+                            end else begin
+                                tx_byte_latch <= {6'b0, mem_read_data[9:8]};  // high
+                                byte_idx      <= 1'b0;
+                                ptr           <= ptr + 1;
+                            end
+                            tx_start <= 1;
                         end
                     end else begin
                         tx_start <= 0;
