@@ -73,32 +73,45 @@ class SerialReader(QtCore.QThread):
         self._running = True
 
     def run(self) -> None:
-        # ser.read(FRAME_BYTES) bloquea hasta tener los bytes o timeout.
-        # Como timeout=0.2 s en setup_serial(), el peor caso es 200 ms de
-        # bloqueo si el FPGA no dispara (no afecta a la UI: estamos en thread).
-        # Throttle de emits: cap a 30 Hz para evitar saturar la cola de
-        # signals de Qt cuando hay backlog en el buffer del OS.
-        MIN_EMIT_INTERVAL = 1.0 / 30
+        # Patrón acumulador: lee lo que esté disponible y mantiene un buffer
+        # interno. Cuando hay FRAME_BYTES bytes acumulados emite un frame.
+        # Esto evita el problema de macOS donde el FTDI entrega chunks de
+        # ~1020 bytes en lugar de 2700, y ser.read(2700) bloqueaba indefinido.
+        MIN_EMIT_INTERVAL = 1.0 / 30  # 30 Hz max emits
         last_emit = 0.0
+        buffer = bytearray()
+        print(f"[reader] thread iniciado, esperando {FRAME_BYTES} bytes/frame")
+        loop_count = 0
         while self._running:
             try:
-                raw = self.ser.read(FRAME_BYTES)
-                if len(raw) < FRAME_BYTES:
-                    # Timeout sin datos suficientes: seguimos esperando.
-                    continue
-                # Drenado: si hay más frames ya esperando, salta al más reciente.
-                while self.ser.in_waiting >= FRAME_BYTES:
-                    raw = self.ser.read(FRAME_BYTES)
-                now = time.monotonic()
-                if now - last_emit < MIN_EMIT_INTERVAL:
-                    # Saltamos este frame para no inundar la UI.
-                    continue
-                last_emit = now
-                # 10 bits empaquetados en uint16 little-endian.
-                # Los 6 MSB son cero, así que no hace falta mask explícito,
-                # pero lo aplicamos por seguridad ante cualquier glitch.
-                data = np.frombuffer(raw, dtype="<u2") & 0x03FF
-                self.frame_ready.emit(data)
+                # Lee lo que haya disponible. Si nada, espera 1 byte (bloquea
+                # corto, max timeout).
+                pending = self.ser.in_waiting
+                to_read = pending if pending > 0 else 1
+                chunk = self.ser.read(to_read)
+                if chunk:
+                    buffer.extend(chunk)
+
+                # Heartbeat cada ~1000 iteraciones (para debug si se cuelga)
+                loop_count += 1
+                if loop_count % 5000 == 0:
+                    print(
+                        f"[reader] alive: buffer={len(buffer)} B, "
+                        f"in_waiting={self.ser.in_waiting}"
+                    )
+
+                # Procesa todos los frames completos que haya en el buffer.
+                while len(buffer) >= FRAME_BYTES:
+                    frame_bytes = bytes(buffer[:FRAME_BYTES])
+                    del buffer[:FRAME_BYTES]
+
+                    now = time.monotonic()
+                    if now - last_emit < MIN_EMIT_INTERVAL:
+                        continue  # throttle: descarta este frame
+                    last_emit = now
+
+                    data = np.frombuffer(frame_bytes, dtype="<u2") & 0x03FF
+                    self.frame_ready.emit(data)
             except serial.SerialException as e:
                 self.error.emit(str(e))
                 break
