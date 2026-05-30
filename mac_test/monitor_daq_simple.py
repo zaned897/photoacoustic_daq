@@ -36,6 +36,8 @@ BIT_DEPTH = 10
 BYTES_PER_SAMPLE = 2
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # 2700
 FRAME_HEADER = b"\xAA\x55\xAA\x55"  # sync preamble (debe coincidir con top.v)
+VERSION_BYTES = 2
+EXPECTED_FW_VERSION = 0x0002
 C_TISSUE = 1540.0
 F_SENSOR = 2.0
 
@@ -115,7 +117,9 @@ def main() -> None:
     }
 
     HDR_LEN = len(FRAME_HEADER)
+    FRAME_TOTAL = HDR_LEN + VERSION_BYTES + FRAME_BYTES
     MAX_BUFFER = 100_000
+    state["version_announced"] = False
 
     def update(_frame):
         # Acumulador + búsqueda de header de sync
@@ -129,18 +133,29 @@ def main() -> None:
         if len(buf) > MAX_BUFFER:
             del buf[: -(HDR_LEN - 1)]
 
-        # Busca el último header completo + frame disponible (descarta backlog)
+        # Busca el último header + version + frame disponible (descarta backlog)
         latest_frame = None
+        latest_version = None
         while True:
             idx = buf.find(FRAME_HEADER)
             if idx < 0:
                 break
             if idx > 0:
                 del buf[:idx]
-            if len(buf) < HDR_LEN + FRAME_BYTES:
+            if len(buf) < FRAME_TOTAL:
                 break
-            latest_frame = bytes(buf[HDR_LEN : HDR_LEN + FRAME_BYTES])
-            del buf[: HDR_LEN + FRAME_BYTES]
+            latest_version = (buf[HDR_LEN] << 8) | buf[HDR_LEN + 1]
+            data_start = HDR_LEN + VERSION_BYTES
+            latest_frame = bytes(buf[data_start : data_start + FRAME_BYTES])
+            del buf[:FRAME_TOTAL]
+
+        if latest_version is not None and not state["version_announced"]:
+            match = "OK" if latest_version == EXPECTED_FW_VERSION else "MISMATCH"
+            print(
+                f"[monitor] FW_VERSION recibido: 0x{latest_version:04X} "
+                f"(esperado 0x{EXPECTED_FW_VERSION:04X}) → {match}"
+            )
+            state["version_announced"] = True
 
         if latest_frame is None:
             return (line, status)

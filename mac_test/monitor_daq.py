@@ -40,6 +40,8 @@ BIT_DEPTH = 10  # Fase 2: D11..D2 del AD9226
 BYTES_PER_SAMPLE = 2  # 10 bits empaquetados en uint16 LE
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # = 2700 bytes/ráfaga
 FRAME_HEADER = b"\xAA\x55\xAA\x55"  # preámbulo de sync — debe coincidir con top.v
+VERSION_BYTES = 2                    # 2 bytes de versión big-endian tras el header
+EXPECTED_FW_VERSION = 0x0002          # firmware que esperamos correr (bump con cada release)
 C_TISSUE = 1540.0
 F_SENSOR = 2.0
 
@@ -80,9 +82,11 @@ class SerialReader(QtCore.QThread):
         # descarta automáticamente al no coincidir con el patrón.
         MIN_EMIT_INTERVAL = 1.0 / 30  # 30 Hz max emits
         HDR_LEN = len(FRAME_HEADER)
+        FRAME_TOTAL = HDR_LEN + VERSION_BYTES + FRAME_BYTES
         MAX_BUFFER = 100_000  # cap de seguridad: si no aparece header, recortar
         last_emit = 0.0
         buffer = bytearray()
+        version_announced = False
         print(f"[reader] thread iniciado, buscando header {FRAME_HEADER.hex()}")
         loop_count = 0
         while self._running:
@@ -114,12 +118,24 @@ class SerialReader(QtCore.QThread):
                     # Descarta basura previa al header
                     if idx > 0:
                         del buffer[:idx]
-                    # ¿Hay header + frame completo?
-                    if len(buffer) < HDR_LEN + FRAME_BYTES:
+                    # ¿Hay header + version + frame completo?
+                    if len(buffer) < FRAME_TOTAL:
                         break
-                    # Extrae frame
-                    frame_bytes = bytes(buffer[HDR_LEN : HDR_LEN + FRAME_BYTES])
-                    del buffer[: HDR_LEN + FRAME_BYTES]
+                    # Extrae versión y frame
+                    ver_hi = buffer[HDR_LEN]
+                    ver_lo = buffer[HDR_LEN + 1]
+                    fw_version = (ver_hi << 8) | ver_lo
+                    data_start = HDR_LEN + VERSION_BYTES
+                    frame_bytes = bytes(buffer[data_start : data_start + FRAME_BYTES])
+                    del buffer[:FRAME_TOTAL]
+
+                    if not version_announced:
+                        match = "OK" if fw_version == EXPECTED_FW_VERSION else "MISMATCH"
+                        print(
+                            f"[reader] FW_VERSION recibido: 0x{fw_version:04X} "
+                            f"(esperado 0x{EXPECTED_FW_VERSION:04X}) → {match}"
+                        )
+                        version_announced = True
 
                     now = time.monotonic()
                     if now - last_emit < MIN_EMIT_INTERVAL:

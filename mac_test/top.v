@@ -131,15 +131,17 @@ module top (
     // trigger_rpi:    pull-down → reposo LOW; flanco activo = LOW→HIGH (pulso RPi)
     // SEND_PREP: 1 ciclo de espera entre CAPTURE y SENDING para que
     // mem_read_data se cargue con memory[0] antes de empezar a transmitir.
-    // SEND_HEADER: envía 4 bytes de preámbulo 0xAA 0x55 0xAA 0x55 antes
-    // de los datos. Python escanea ese patrón para resincronizarse en cada
-    // ráfaga — necesario porque Mac/Linux entregan chunks irregulares y sin
-    // framing un solo byte perdido desfasa todas las muestras 10-bit en
-    // pares low/high.
+    // SEND_HEADER: envía 6 bytes de preámbulo antes de los datos:
+    //   bytes 0..3: 0xAA 0x55 0xAA 0x55 (sync magic, único en nuestro protocolo
+    //               porque los high bytes de muestras nunca son 0x55)
+    //   bytes 4..5: FW_VERSION en big-endian (debug — Python imprime al recibir
+    //               el primer frame para confirmar qué bitstream está activo)
+    // Bumpea FW_VERSION cada vez que cambies el firmware significativamente.
+    parameter [15:0] FW_VERSION = 16'h0002;   // v0.2 — header + version metadata
     localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2,
                SEND_HEADER = 3, SENDING = 4;
     reg [2:0] state = IDLE;
-    reg [2:0] header_idx;       // 0..4 (4 bytes a enviar)
+    reg [2:0] header_idx;       // 0..6 (4 bytes header + 2 bytes version)
 
     reg man_d1, man_d2, rpi_d1, rpi_d2;
 
@@ -220,20 +222,22 @@ module top (
                     header_idx <= 0;
                 end
 
-                // Envía los 4 bytes del preámbulo de sincronización:
-                // 0xAA 0x55 0xAA 0x55 — alternancia 1010/0101 fácil de
-                // detectar y poco probable de aparecer en datos válidos
-                // (sample 10-bit válido nunca tiene high byte > 0x03).
+                // Envía los 6 bytes de preámbulo:
+                //   0..3: sync magic 0xAA 0x55 0xAA 0x55
+                //   4..5: FW_VERSION (big-endian)
                 SEND_HEADER: begin
                     if (!tx_busy && !tx_start) begin
-                        if (header_idx == 3'd4) begin
+                        if (header_idx == 3'd6) begin
                             state <= SENDING;
                         end else begin
-                            case (header_idx[1:0])
-                                2'd0: tx_byte_latch <= 8'hAA;
-                                2'd1: tx_byte_latch <= 8'h55;
-                                2'd2: tx_byte_latch <= 8'hAA;
-                                2'd3: tx_byte_latch <= 8'h55;
+                            case (header_idx)
+                                3'd0: tx_byte_latch <= 8'hAA;
+                                3'd1: tx_byte_latch <= 8'h55;
+                                3'd2: tx_byte_latch <= 8'hAA;
+                                3'd3: tx_byte_latch <= 8'h55;
+                                3'd4: tx_byte_latch <= FW_VERSION[15:8];
+                                3'd5: tx_byte_latch <= FW_VERSION[7:0];
+                                default: tx_byte_latch <= 8'h00;
                             endcase
                             header_idx <= header_idx + 1;
                             tx_start   <= 1;
