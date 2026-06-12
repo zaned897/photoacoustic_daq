@@ -91,7 +91,7 @@ module top (
     //   50 Hz → ventana de 20 ms → 15.5 ms libres entre capturas
     //   10 Hz → ventana de 100 ms → 95.5 ms libres
     //   100 Hz → ventana de 10 ms → 5.5 ms libres (límite cercano al TX UART)
-    parameter AUTO_TRIGGER_HZ = 20;
+    parameter AUTO_TRIGGER_HZ = 0;   // desactivado — captura por pulso externo
     localparam [25:0] AUTO_TRIG_MAX =
         (AUTO_TRIGGER_HZ == 0) ? 26'h3FFFFFF : (27_000_000 / AUTO_TRIGGER_HZ - 1);
 
@@ -137,7 +137,7 @@ module top (
     //   bytes 4..5: FW_VERSION en big-endian (debug — Python imprime al recibir
     //               el primer frame para confirmar qué bitstream está activo)
     // Bumpea FW_VERSION cada vez que cambies el firmware significativamente.
-    parameter [15:0] FW_VERSION = 16'h0002;   // v0.2 — header + version metadata
+    parameter [15:0] FW_VERSION = 16'h0003;   // v0.3 — trigger externo por pulso, auto-trigger off
     localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2,
                SEND_HEADER = 3, SENDING = 4;
     reg [2:0] state = IDLE;
@@ -164,13 +164,17 @@ module top (
         end
     end
 
-    // NOTA: trigger_rpi temporalmente deshabilitado porque el pin 77 capta
-    // ruido capacitivo del bus ADC (líneas D0..D11 conmutando a 27 MHz a pocos
-    // mm del pin) y dispara triggers espurios → FSM se queda en CAPTURE/SENDING
-    // continuamente → satura el USB → Python no alcanza → plot congelado.
-    // Para reactivar: agregar pull-down externo de 10kΩ entre pin 77 y GND.
-    wire trigger_event = manual_posedge | auto_trig_pulse;
-    /* verilator lint_off UNUSED */ wire _unused_rpi = rpi_posedge; /* verilator lint_on UNUSED */
+    // trigger_rpi HABILITADO: pulso externo (~400 ns de ancho) en pin 77 abre
+    // la ventana de captura. A 27 MHz un pulso de 400 ns dura ~10.8 ciclos —
+    // el sincronizador de 2 FF lo detecta sin problema (ancho mínimo ≈ 2
+    // ciclos = 74 ns). El flanco de SUBIDA del pulso inicia la captura; la
+    // latencia trigger→primera muestra es de 3 ciclos (~111 ns), constante.
+    //
+    // IMPORTANTE — hardware: el pin 77 capta ruido capacitivo del bus ADC
+    // (D0..D11 conmutando a 27 MHz a pocos mm). Sin un pull-down externo de
+    // 10kΩ entre pin 77 y GND habrá triggers espurios continuos que saturan
+    // el USB y congelan el plot. Instalar la resistencia ANTES de flashear.
+    wire trigger_event = manual_posedge | rpi_posedge | auto_trig_pulse;
 
     always @(posedge sys_clk) begin
         man_d1 <= trigger_manual;

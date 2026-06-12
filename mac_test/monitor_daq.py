@@ -41,7 +41,7 @@ BYTES_PER_SAMPLE = 2  # 10 bits empaquetados en uint16 LE
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # = 2700 bytes/ráfaga
 FRAME_HEADER = b"\xAA\x55\xAA\x55"  # preámbulo de sync — debe coincidir con top.v
 VERSION_BYTES = 2                    # 2 bytes de versión big-endian tras el header
-EXPECTED_FW_VERSION = 0x0002          # firmware que esperamos correr (bump con cada release)
+EXPECTED_FW_VERSION = 0x0003          # firmware que esperamos correr (bump con cada release)
 C_TISSUE = 1540.0
 F_SENSOR = 2.0
 
