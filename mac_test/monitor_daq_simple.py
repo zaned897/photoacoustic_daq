@@ -29,17 +29,17 @@ from serial_helper import find_uart_port  # noqa: E402
 
 # --- Configuración ---
 SERIAL_PORT = find_uart_port()
-BAUD_RATE = 3_000_000
-SAMPLE_SIZE = 1350
-FS_MHZ = 27.0
+BAUD_RATE = 1_000_000  # debe coincidir con top.v (FW v0.4)
+SAMPLE_SIZE = 270
+FS_MHZ = 54.0
 BIT_DEPTH = 10
 BYTES_PER_SAMPLE = 2
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # 2700
 FRAME_HEADER = b"\xAA\x55\xAA\x55"  # sync preamble (debe coincidir con top.v)
 VERSION_BYTES = 2
-EXPECTED_FW_VERSION = 0x0003
+EXPECTED_FW_VERSION = 0x0007
 C_TISSUE = 1540.0
-F_SENSOR = 2.0
+F_SENSOR = 2.5
 
 # --- Derivados ---
 PERIOD_US = 1.0 / FS_MHZ
@@ -59,7 +59,9 @@ def dist_to_time(dist_val: float) -> float:
 
 def main() -> None:
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        # exclusive=True: si otro proceso ya tiene el puerto, fallar aquí con
+        # mensaje claro en vez de repartirse los bytes en silencio (macOS).
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1, exclusive=True)
         try:
             ser.set_low_latency_mode(True)
         except (NotImplementedError, OSError):
@@ -71,8 +73,10 @@ def main() -> None:
         sys.exit(1)
 
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    plt.subplots_adjust(top=0.88, bottom=0.12)
+    fig, (ax, ax_zoom) = plt.subplots(
+        2, 1, figsize=(12, 8), height_ratios=[2, 1]
+    )
+    plt.subplots_adjust(top=0.90, bottom=0.08, hspace=0.45)
 
     fig.suptitle(
         "PHOTOACOUSTIC DAQ — matplotlib monitor",
@@ -98,6 +102,33 @@ def main() -> None:
 
     (line,) = ax.plot(TIME_AXIS, np.zeros(SAMPLE_SIZE), color="#00f2ff", lw=1)
 
+    # ─── Panel de zoom: primeros µs tras el trigger ──────────────────────────
+    # El evento fotoacústico (ringing ~400 ns) vive al inicio de la ventana;
+    # en la vista completa de 50 µs es invisible. Aquí: frame crudo + promedio
+    # coherente de los últimos AVG_N frames (el trigger determinista alinea
+    # los eventos → el promedio crece la señal y suprime ruido en √N).
+    ZOOM_US = 2.0
+    AVG_N = 32
+    zoom_n = int(ZOOM_US / PERIOD_US)
+    ax_zoom.set_title(
+        f"Zoom 0–{ZOOM_US:.0f} µs · promedio coherente de {AVG_N} frames",
+        fontsize=9,
+        color="gray",
+    )
+    ax_zoom.set_xlabel("Time of Flight (µs)", fontsize=10, color="#bdc3c7")
+    ax_zoom.set_ylabel("ADC LSB", fontsize=10, color="#bdc3c7")
+    ax_zoom.set_xlim(0, ZOOM_US)
+    ax_zoom.grid(True, linestyle="--", alpha=0.2)
+    (line_zoom,) = ax_zoom.plot(
+        TIME_AXIS[:zoom_n], np.zeros(zoom_n),
+        color="#475569", lw=0.8, label="último frame",
+    )
+    (line_avg,) = ax_zoom.plot(
+        TIME_AXIS[:zoom_n], np.zeros(zoom_n),
+        color="#facc15", lw=1.5, label=f"promedio ×{AVG_N}",
+    )
+    ax_zoom.legend(loc="upper right", fontsize=8)
+
     status = ax.text(
         0.02,
         0.96,
@@ -110,10 +141,13 @@ def main() -> None:
         bbox=dict(boxstyle="round", facecolor="#1e293b", alpha=0.85),
     )
 
+    from collections import deque
+
     state = {
         "buffer": bytearray(),
         "last_time": time.time(),
         "fps_smoothed": 0.0,
+        "avg_frames": deque(maxlen=AVG_N),
     }
 
     HDR_LEN = len(FRAME_HEADER)
@@ -123,9 +157,22 @@ def main() -> None:
 
     def update(_frame):
         # Acumulador + búsqueda de header de sync
-        pending = ser.in_waiting
-        if pending:
-            state["buffer"].extend(ser.read(pending))
+        try:
+            pending = ser.in_waiting
+            if pending:
+                state["buffer"].extend(ser.read(pending))
+        except OSError:
+            # El FTDI desapareció del USB (cable suelto / reset del puerto).
+            # Avisar una sola vez y dejar la ventana abierta con el último frame.
+            if not state.get("usb_lost"):
+                state["usb_lost"] = True
+                print(
+                    "[monitor] ⚠ USB desconectado — reconecta la placa y "
+                    "reinicia el monitor."
+                )
+                status.set_text("USB DESCONECTADO")
+                status.set_color("#f87171")
+            return (line, status)
 
         buf = state["buffer"]
 
@@ -170,6 +217,16 @@ def main() -> None:
             data[i] = (int(left) + int(right)) // 2
 
         line.set_ydata(data)
+
+        # Panel de zoom: frame crudo + promedio coherente
+        state["avg_frames"].append(data[:zoom_n].astype(np.float64))
+        avg = np.mean(state["avg_frames"], axis=0)
+        line_zoom.set_ydata(data[:zoom_n])
+        line_avg.set_ydata(avg)
+        # Autoescala del zoom alrededor del promedio (señales de pocos LSB)
+        margin = max(5.0, float(avg.max() - avg.min()) * 0.5 + 2)
+        center = float(avg.mean())
+        ax_zoom.set_ylim(center - margin * 2, center + margin * 2)
 
         now = time.time()
         dt = now - state["last_time"]

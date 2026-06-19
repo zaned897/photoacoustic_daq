@@ -78,11 +78,9 @@ module top (
     //   {4'b0, mem_read_data[11:8]} en lugar de {6'b0, mem_read_data[9:8]}.
     wire [9:0] adc_data = adc_data_raw[11:2];
 
-    // 54 MSPS × 5 µs = 270 muestras
-    // Cubre el evento fotoacústico (ringing ~350 ns) + margen acústico hasta
-    // ~3.75 mm de profundidad (v_sonido = 1500 m/s). 18.5 ns/muestra →
-    // ~19 muestras sobre el evento de 350 ns. Frame: 270×2+6 = 546 B.
-    parameter BURST_SIZE = 270;
+    // 27 MSPS × 50 µs = 1350 muestras
+    // Cubre señal acústica de 0 a 37.5 mm de profundidad (v_sonido = 1500 m/s)
+    parameter BURST_SIZE = 1350;
 
     // ─── AUTO-TRIGGER INTERNO ────────────────────────────────────────────────
     // Genera un trigger periódico sin necesidad de S2 o trigger_rpi externo.
@@ -93,37 +91,15 @@ module top (
     //   50 Hz → ventana de 20 ms → 15.5 ms libres entre capturas
     //   10 Hz → ventana de 100 ms → 95.5 ms libres
     //   100 Hz → ventana de 10 ms → 5.5 ms libres (límite cercano al TX UART)
-    parameter AUTO_TRIGGER_HZ = 20;  // DEBUG: aísla el enlace UART del trigger — revertir a 0
+    parameter AUTO_TRIGGER_HZ = 20;  // DEBUG pot-DC: monitoreo continuo, revertir a 0
     localparam [25:0] AUTO_TRIG_MAX =
-        (AUTO_TRIGGER_HZ == 0) ? 26'h3FFFFFF : (54_000_000 / AUTO_TRIGGER_HZ - 1);
+        (AUTO_TRIGGER_HZ == 0) ? 26'h3FFFFFF : (27_000_000 / AUTO_TRIGGER_HZ - 1);
 
-    // ─── PLL: 27 MHz (cristal) → 54 MHz (reloj del sistema y muestreo) ────────
-    // FVCO = FCLKIN × (FBDIV+1) × ODIV / (IDIV+1) dentro de 400–1200 MHz.
-    //   IDIV_SEL=0, FBDIV_SEL=1 → ×2 → 54 MHz;  ODIV_SEL=8 → FVCO=432 MHz (OK).
-    // Todo el diseño corre a 54 MHz: captura @ 54 MSPS (18.5 ns/muestra),
-    // FSM y UART reescalados. sys_clk (pin 52) solo alimenta el PLL.
-    // VERIFICADO EN HARDWARE: el PLL engancha y produce datos coherentes.
-    wire clk;        // 54 MHz — reloj global del diseño
-    wire pll_lock;
-    rPLL #(
-        .FCLKIN("27"), .IDIV_SEL(0), .FBDIV_SEL(1), .ODIV_SEL(8),
-        .DYN_SDIV_SEL(2), .PSDA_SEL("0000"), .DUTYDA_SEL("1000"),
-        .CLKOUT_FT_DIR(1'b1), .CLKOUTP_FT_DIR(1'b1),
-        .CLKOUT_DLY_STEP(0), .CLKOUTP_DLY_STEP(0),
-        .CLKFB_SEL("internal"), .CLKOUT_BYPASS("false"),
-        .CLKOUTP_BYPASS("false"), .CLKOUTD_BYPASS("false"),
-        .CLKOUTD_SRC("CLKOUT"), .CLKOUTD3_SRC("CLKOUT"), .DEVICE("GW1NR-9C")
-    ) pll (
-        .CLKOUT(clk), .LOCK(pll_lock), .CLKOUTP(), .CLKOUTD(), .CLKOUTD3(),
-        .RESET(1'b0), .RESET_P(1'b0), .CLKIN(sys_clk), .CLKFB(1'b0),
-        .FBDSEL(6'b0), .IDSEL(6'b0), .ODSEL(6'b0),
-        .PSDA(4'b0), .DUTYDA(4'b0), .FDLY(4'b0)
-    );
-
-    // El ADC muestrea en el flanco de subida de adc_clk = ~clk: captura en el
-    // flanco de BAJADA del reloj de 54 MHz; el FPGA registra adc_data en el
-    // siguiente flanco de SUBIDA → margen de setup ≈ 9.25 ns (medio período).
-    assign adc_clk = ~clk;
+    // El ADC muestrea en el flanco de subida de adc_clk.
+    // adc_clk = ~sys_clk: el ADC captura en el flanco de BAJADA de sys_clk.
+    // El FPGA registra adc_data en el siguiente flanco de SUBIDA de sys_clk,
+    // garantizando un margen de setup de ~18.5 ns (medio período a 27 MHz).
+    assign adc_clk = ~sys_clk;
 
     (* ram_style = "block" *)
     reg [9:0]  memory [0:BURST_SIZE-1];   // 10 bits/muestra (Fase 2)
@@ -139,11 +115,11 @@ module top (
     // El (* IOB = "true" *) le indica al placer que ponga estos flops dentro
     // del IO cell mismo, eliminando la incertidumbre de la red interna.
     (* IOB = "true" *) reg [9:0] adc_data_reg;
-    always @(posedge clk) begin
+    always @(posedge sys_clk) begin
         adc_data_reg <= adc_data;
     end
 
-    always @(posedge clk) begin
+    always @(posedge sys_clk) begin
         if (ram_write_en)
             memory[ptr] <= adc_data_reg;   // usa la versión registrada
         mem_read_data <= memory[ptr];
@@ -161,7 +137,7 @@ module top (
     //   bytes 4..5: FW_VERSION en big-endian (debug — Python imprime al recibir
     //               el primer frame para confirmar qué bitstream está activo)
     // Bumpea FW_VERSION cada vez que cambies el firmware significativamente.
-    parameter [15:0] FW_VERSION = 16'h0007;   // v0.5-debug — auto-trigger 20 Hz (aislar enlace)
+    parameter [15:0] FW_VERSION = 16'h0003;   // v0.3 — trigger externo por pulso, auto-trigger off
     localparam IDLE = 0, CAPTURE = 1, SEND_PREP = 2,
                SEND_HEADER = 3, SENDING = 4;
     reg [2:0] state = IDLE;
@@ -176,7 +152,7 @@ module top (
     reg [25:0] auto_trig_cnt = 0;
     reg        auto_trig_pulse = 0;
 
-    always @(posedge clk) begin
+    always @(posedge sys_clk) begin
         auto_trig_pulse <= 0;
         if (AUTO_TRIGGER_HZ != 0) begin
             if (auto_trig_cnt >= AUTO_TRIG_MAX) begin
@@ -198,14 +174,11 @@ module top (
     // (D0..D11 conmutando a 27 MHz a pocos mm). Sin un pull-down externo de
     // 10kΩ entre pin 77 y GND habrá triggers espurios continuos que saturan
     // el USB y congelan el plot. Instalar la resistencia ANTES de flashear.
-    // trigger_rpi HABILITADO: pulso externo (~400 ns) en pin 77 abre la ventana.
-    // El sincronizador de 2 FF necesita ≥2 ciclos (74 ns) de ancho de pulso.
-    // Latencia trigger→primera muestra: 3 ciclos (~111 ns), constante.
-    // RECOMENDADO: pull-down externo de 10k entre pin 77 y GND contra el
-    // ruido capacitivo del bus ADC (triggers espurios si la línea flota).
-    wire trigger_event = manual_posedge | rpi_posedge | auto_trig_pulse;
+    // DEBUG pot-DC: pin 77 ignorado hasta instalar pull-down de 10k
+    wire trigger_event = manual_posedge | auto_trig_pulse;
+    /* verilator lint_off UNUSED */ wire _unused_rpi = rpi_posedge; /* verilator lint_on UNUSED */
 
-    always @(posedge clk) begin
+    always @(posedge sys_clk) begin
         man_d1 <= trigger_manual;
         man_d2 <= man_d1;
         rpi_d1 <= trigger_rpi;
@@ -220,7 +193,7 @@ module top (
     // led_busy = 0 (LOW) cuando state != IDLE → LED ON durante captura y envío.
     assign led_busy = (state == IDLE);
 
-    always @(posedge clk or negedge sys_rst_n) begin
+    always @(posedge sys_clk or negedge sys_rst_n) begin
         if (!sys_rst_n) begin
             state        <= IDLE;
             ptr          <= 0;
@@ -312,11 +285,10 @@ module top (
     end
 
     uart_tx_module #(
-        .CLK_FREQ  (54_000_000),
-        .BAUD_RATE (1_000_000)    // CLK_PER_BIT = 54 — divisor exacto a 54 MHz.
-                                  // Frame: 546 B → ~5.5 ms. Alta tasa de repetición.
+        .CLK_FREQ  (27_000_000),
+        .BAUD_RATE (3_000_000)    // CLK_PER_BIT = 9 — divisor exacto, error de baud = 0%
     ) uart_inst (
-        .clk     (clk),
+        .clk     (sys_clk),
         .rst_n   (sys_rst_n),
         .tx_start(tx_start),
         .tx_data (tx_byte_latch),

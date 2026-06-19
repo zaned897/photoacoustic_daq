@@ -33,17 +33,17 @@ from serial_helper import find_uart_port  # noqa: E402
 
 # --- Configuración ---
 SERIAL_PORT = find_uart_port()
-BAUD_RATE = 3_000_000
-SAMPLE_SIZE = 1350  # muestras por ráfaga
-FS_MHZ = 27.0
+BAUD_RATE = 1_000_000  # debe coincidir con top.v (FW v0.4)
+SAMPLE_SIZE = 270  # muestras por ráfaga
+FS_MHZ = 54.0
 BIT_DEPTH = 10  # Fase 2: D11..D2 del AD9226
 BYTES_PER_SAMPLE = 2  # 10 bits empaquetados en uint16 LE
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # = 2700 bytes/ráfaga
 FRAME_HEADER = b"\xAA\x55\xAA\x55"  # preámbulo de sync — debe coincidir con top.v
 VERSION_BYTES = 2                    # 2 bytes de versión big-endian tras el header
-EXPECTED_FW_VERSION = 0x0003          # firmware que esperamos correr (bump con cada release)
+EXPECTED_FW_VERSION = 0x0005          # firmware que esperamos correr (bump con cada release)
 C_TISSUE = 1540.0
-F_SENSOR = 2.0
+F_SENSOR = 2.5
 
 # --- Derivados ---
 PERIOD_US = 1.0 / FS_MHZ
