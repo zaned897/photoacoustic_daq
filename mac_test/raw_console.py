@@ -1,12 +1,14 @@
 """
-PHOTOACOUSTIC DAQ — Monitor de consola en crudo (modo voltímetro).
+Monitor de consola robusto (modo voltímetro) con AUTO-RECONEXIÓN.
 
-Cada segundo imprime una línea con:
-  - bytes/s recibidos en crudo
-  - hex de los primeros bytes del segundo (acotado)
-  - muestras decodificadas [0xA5][0x5A][high][low] → código 10-bit y voltios
+Distingue claramente tres estados para que nunca confundas "enlace caído" con
+"señal en cero":
 
-Sin matplotlib, sin ventanas: solo la verdad del puerto serial.
+    ● LIVE        — llegan muestras, muestra código→voltaje
+    ○ SIN TRIGGER — puerto abierto pero 0 bytes (enlace ok o sin disparo)
+    ✗ LINK DOWN   — el puerto desapareció (USB marginal); reintenta solo
+
+Protocolo: [0xA5][0x5A][hi][lo], 10-bit, 115200 baud.
 
     pipenv run python mac_test/raw_console.py
 """
@@ -20,73 +22,93 @@ import serial
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from serial_helper import find_uart_port  # noqa: E402
 
-BAUD_RATE = 115_200
+BAUD = 115_200
 SYNC = b"\xA5\x5A"
-LSB_VOLTS = 10.0 / 1024  # frontend ±5 V, 10 bits → 9.77 mV/LSB
-MID_CODE = 512
+LSB_VOLTS = 10.0 / 1024
+MID = 512
+
+
+def open_port():
+    """Abre el puerto, reintentando hasta que aparezca. Devuelve el serial."""
+    while True:
+        port = find_uart_port(verbose=False)
+        try:
+            ser = serial.Serial(port, BAUD, timeout=0.1, exclusive=True)
+            ser.reset_input_buffer()
+            print(f"● conectado: {port} @ {BAUD} baud")
+            return ser
+        except (serial.SerialException, OSError):
+            print(f"✗ esperando puerto ({port})… reintentando")
+            time.sleep(1.0)
 
 
 def main() -> None:
-    port = find_uart_port()
-    try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=0.1, exclusive=True)
-        ser.reset_input_buffer()
-        print(f"Conectado: {port} @ {BAUD_RATE} baud — Ctrl+C para salir\n")
-    except serial.SerialException as error:
-        print(f"ERROR de puerto: {error}")
-        sys.exit(1)
-
+    print("Monitor robusto — Ctrl+C para salir\n")
+    ser = open_port()
     buf = bytearray()
+    silent_since = None
+
     try:
         while True:
             t0 = time.time()
-            raw_count = 0
-            first_hex = ""
+            raw = 0
             codes = []
-            while time.time() - t0 < 1.0:
-                n = ser.in_waiting
-                if n:
-                    chunk = ser.read(n)
-                    raw_count += len(chunk)
-                    if not first_hex:
-                        first_hex = chunk[:12].hex(" ")
-                    buf.extend(chunk)
-                # decodifica todas las muestras completas disponibles
-                while True:
-                    idx = buf.find(SYNC)
-                    if idx < 0:
-                        del buf[:-1]
-                        break
-                    if len(buf) < idx + 4:
-                        del buf[:idx]
-                        break
-                    high, low = buf[idx + 2], buf[idx + 3]
-                    del buf[: idx + 4]
-                    if high <= 0x03:
-                        codes.append((high << 8) | low)
-                time.sleep(0.02)
+            # ventana de 1 s; si el puerto muere, salta a reconexión
+            try:
+                while time.time() - t0 < 1.0:
+                    n = ser.in_waiting
+                    if n:
+                        chunk = ser.read(n)
+                        raw += len(chunk)
+                        buf.extend(chunk)
+                    while True:
+                        i = buf.find(SYNC)
+                        if i < 0:
+                            del buf[:-1]
+                            break
+                        if len(buf) < i + 4:
+                            del buf[:i]
+                            break
+                        hi, lo = buf[i + 2], buf[i + 3]
+                        del buf[: i + 4]
+                        if hi <= 0x03:
+                            codes.append((hi << 8) | lo)
+                    time.sleep(0.02)
+            except (OSError, serial.SerialException):
+                print(f"{time.strftime('%H:%M:%S')}  ✗ LINK DOWN — reconectando…")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = open_port()
+                buf.clear()
+                continue
 
             stamp = time.strftime("%H:%M:%S")
-            if raw_count == 0:
-                print(f"{stamp}  ── sin datos ── (UART en silencio)")
-            elif not codes:
-                print(
-                    f"{stamp}  {raw_count:5d} B/s  raw=[{first_hex}]  "
-                    f"sin muestras válidas (¿baud/firmware?)"
-                )
-            else:
+            if codes:
                 last = codes[-1]
-                volts = (last - MID_CODE) * LSB_VOLTS
+                v = (last - MID) * LSB_VOLTS
                 cmin, cmax = min(codes), max(codes)
                 print(
-                    f"{stamp}  {raw_count:5d} B/s  muestras={len(codes):3d}  "
-                    f"código={last:4d} [{cmin}–{cmax}]  →  {volts:+7.3f} V"
+                    f"{stamp}  ● LIVE   {raw:6d} B/s  n={len(codes):4d}  "
+                    f"código={last:4d} [{cmin}–{cmax}]  →  {v:+7.3f} V"
+                )
+                silent_since = None
+            else:
+                if silent_since is None:
+                    silent_since = time.time()
+                dt = time.time() - silent_since
+                print(
+                    f"{stamp}  ○ SIN TRIGGER ({dt:.0f} s sin datos — "
+                    f"enlace ok o sin disparo)"
                 )
     except KeyboardInterrupt:
         print("\nfin.")
     finally:
-        if ser.is_open:
+        try:
             ser.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
