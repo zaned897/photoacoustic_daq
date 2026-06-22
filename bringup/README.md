@@ -17,11 +17,17 @@ N+1 falla, el problema está exactamente en lo que la N+1 agregó.
 | 0 | `stage0_heartbeat/` | Reloj + configuración del bitstream | LED parpadea a ~0.8 Hz | no |
 | 1 | `stage1_trigger/`   | Entrada de trigger + detección de flanco | S2 alterna el LED; pin 77 enciende otro LED | no |
 | 2 | `stage2_uart_link/` | Enlace pin 17 → FTDI (el nudo del día) | Host recibe un contador conocido | **sí** |
-| 3 | `stage3_trigger_uart/` | Trigger → mensaje por UART | Cada disparo envía un byte conocido | sí |
-| 4 | `stage4_adc_live/`  | Lectura ADC + cuantización (voltímetro) | Nivel DC correcto en el host | sí |
-| 5 | `stage5_burst/`     | Captura en ventana por trigger | Ráfaga completa por evento | sí |
+| 3 | `stage3_adc_voltmeter/` | Lectura ADC en vivo (voltímetro) | Nivel DC correcto en el host | sí |
+| 4 | `stage4_internal_trigger/` | Captura disparada por reloj interno 5 kHz | Lectura DC, ahora por evento | sí |
+| 5 | `stage5_external_trigger/` | Captura por pin 77 / S2 | Datos solo con trigger; LED de trigger | sí |
+| 6 | `stage6_burst/`     | Ráfaga de 270 muestras @ 27 MSPS (10 µs) | Forma de onda de la ventana | sí |
+| 7 | `stage7_burst54/`   | Ráfaga @ 54 MSPS vía PLL (18.5 ns/muestra) | El doble de puntos sobre el evento | sí |
+| 8 | `stage8_burst54_12b/` | Ráfaga @ 54 MSPS + **12 bits** (LSB 2.44 mV) | 4× resolución vertical | sí |
 
-(Las etapas 2–5 se crean cuando lleguemos a ellas, para no adelantar diseño.)
+Todas las etapas validadas (✅). Visualizador para 6–8: `mac_test/window_live.py`
+(ajusta `BITS` y `FS_MHZ` según la etapa flasheada). Pendiente: etapa 9
+(pre-trigger) para centrar eventos coincidentes con el disparo.
+Resumen completo: [`docs/PROGRESO.md`](../docs/PROGRESO.md).
 
 ## Criterio de avance
 

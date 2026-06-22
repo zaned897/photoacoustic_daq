@@ -1,16 +1,18 @@
 """
-Visualizador de VENTANA en vivo (pyqtgraph) — captura en ráfaga por trigger.
+Visualizador de VENTANA en vivo (pyqtgraph) — réplica tipo osciloscopio.
 
-Para el firmware de la etapa 6 (bringup/stage6_burst): cada trigger envía una
-ventana de 270 muestras @ 27 MSPS (10 µs). Muestra:
+Firmware etapa 6 (bringup/stage6_burst): cada trigger envía una ventana de 270
+muestras @ 27 MSPS (10 µs). Tres paneles:
 
-  - Panel superior: ventana completa (10 µs), forma de onda cruda.
-  - Panel inferior: ZOOM al inicio (0–2 µs, donde vive el evento ~350 ns) con
-    promedio coherente de las últimas N ventanas — saca señales de pocos LSB
-    (tu pulso ~150 mV ≈ 15 códigos) del ruido (mejora √N).
+  1. VENTANA COMPLETA (10 µs) en mV, con una REGIÓN arrastrable que define el
+     zoom (overview + detalle, estilo osciloscopio).
+  2. ZOOM en vivo de la región seleccionada: muestras discretas (símbolos),
+     eje X doble (tiempo µs abajo / muestra # arriba), eje Y doble (mV izq /
+     código der, con offset), promedio coherente ×N para señales pequeñas.
+  3. HISTÓRICO: min/max (mV) de cada ventana en el tiempo — estabilidad del pulso.
 
-Robusto: auto-reconexión + estado de enlace (LIVE / SIN TRIGGER / LINK DOWN).
-Frame: [0xAA 0x55 0xAA 0x55] + 270×uint16 LE (10-bit).
+Niveles: frontend ±5 V, 0 V = código 512, LSB = 9.766 mV.
+Robusto: auto-reconexión + estado de enlace, sin parpadeo (histéresis).
 
     pipenv run python mac_test/window_live.py
 """
@@ -33,30 +35,51 @@ BAUD = 115_200
 HDR = b"\xAA\x55\xAA\x55"
 N = 270
 FRAME_BYTES = N * 2
-FS_MHZ = 27.0
+FS_MHZ = 54.0   # etapa 7 (PLL). Para la etapa 6 (27 MSPS) poner 27.0.
 PERIOD_US = 1.0 / FS_MHZ
-TIME_US = np.arange(N) * PERIOD_US        # 0..~10 µs
-ZOOM_US = 2.0
-ZOOM_N = int(ZOOM_US / PERIOD_US)         # ~54 muestras
+TS_NS = PERIOD_US * 1000.0                 # ≈37.0 ns @ 27 MSPS
+TIME_US = np.arange(N) * PERIOD_US         # 0..~10 µs
+BITS = 12                                  # etapa 8 = 12 bits; etapa 6/7 = 10
+MASK = (1 << BITS) - 1                      # 0x0FFF (12b) / 0x03FF (10b)
+MID = 1 << (BITS - 1)                       # 0 V ≈ media escala (2048 / 512)
+MV_PER_LSB = (10.0 / (1 << BITS)) * 1000.0  # 2.44 mV (12b) / 9.77 mV (10b)
+ZOOM_US0 = 0.3                             # región de zoom inicial (0..300 ns):
+                                           # enfoca la envolvente del pulso (~104 ns)
 AVG_N = 32
 POLL_MS = 20
-LSB_VOLTS = 10.0 / 1024   # frontend ±5 V, 10 bits → 9.77 mV/LSB
-MID = 512                 # 0 V ≈ media escala
+HIST_S = 30.0                              # ventana del histórico
+LIVE_HOLD_S = 0.7                          # histéresis del estado LIVE
+
+
+def code_to_mv(code):
+    return (np.asarray(code, dtype=float) - MID) * MV_PER_LSB
+
+
+class CodeAxis(pg.AxisItem):
+    """Eje Y derecho: reetiqueta mV como código del ADC (con offset)."""
+    def tickStrings(self, values, scale, spacing):
+        return [f"{int(round(v / MV_PER_LSB + MID))}" for v in values]
+
+
+class SampleAxis(pg.AxisItem):
+    """Eje X superior: reetiqueta tiempo (µs) como número de muestra."""
+    def tickStrings(self, values, scale, spacing):
+        return [f"{int(round(v / PERIOD_US))}" for v in values]
 
 
 class WindowView(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DAQ — Ventana de captura en vivo")
-        self.resize(1000, 720)
+        self.setWindowTitle("DAQ — Ventana (osciloscopio) en vivo")
+        self.resize(1050, 820)
         lay = QtWidgets.QVBoxLayout(self)
 
         header = QtWidgets.QHBoxLayout()
         self.status = QtWidgets.QLabel("○ conectando…")
         self.status.setStyleSheet("font-size:15px; font-weight:bold;")
-        self.readout = QtWidgets.QLabel("--- V")
+        self.readout = QtWidgets.QLabel("min --- / max --- mV")
         self.readout.setStyleSheet(
-            "font-size:34px; font-weight:bold; color:#00d0ff;")
+            "font-size:24px; font-weight:bold; color:#00d0ff;")
         self.readout.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         header.addWidget(self.status)
         header.addStretch()
@@ -65,36 +88,88 @@ class WindowView(QtWidgets.QWidget):
 
         pg.setConfigOptions(antialias=True)
 
+        win_us = TIME_US[-1]
+
+        # ── Panel 1: ventana completa con región de zoom ──────────────────────
         self.p_full = pg.PlotWidget()
         self.p_full.setBackground("#0b0f14")
         self.p_full.showGrid(x=True, y=True, alpha=0.25)
-        self.p_full.setTitle("Ventana completa (10 µs)")
-        self.p_full.setLabel("left", "ADC (códigos)")
-        self.p_full.setLabel("bottom", "Tiempo", units="µs")
-        self.p_full.setYRange(0, 1023)
-        self.c_full = self.p_full.plot(pen=pg.mkPen("#00d0ff", width=1))
+        self.p_full.setTitle(
+            f"<b>Ventana completa</b> · {win_us:.1f} µs · {N} muestras @ "
+            f"{FS_MHZ:.0f} MSPS — la franja amarilla = región del zoom (arrástrala)")
+        self.p_full.setLabel("left", "Amplitud", units="mV")
+        self.p_full.setLabel("bottom", "Tiempo desde el trigger", units="µs")
+        self.p_full.addLegend(offset=(-10, 10), labelTextColor="#cbd5e1")
+        self.c_full = self.p_full.plot(
+            pen=pg.mkPen("#00d0ff", width=1), name="señal capturada")
+        self.region = pg.LinearRegionItem([0.0, ZOOM_US0], brush=(250, 204, 21, 40))
+        self.region.setZValue(10)
+        self.p_full.addItem(self.region)
+        self.region.sigRegionChanged.connect(self._sync_zoom_x)
         lay.addWidget(self.p_full, stretch=2)
 
-        self.p_zoom = pg.PlotWidget()
+        # ── Panel 2: zoom vivo de la región (ejes dobles + muestras) ──────────
+        self.p_zoom = pg.PlotWidget(axisItems={
+            "right": CodeAxis(orientation="right"),
+            "top": SampleAxis(orientation="top"),
+        })
         self.p_zoom.setBackground("#0b0f14")
         self.p_zoom.showGrid(x=True, y=True, alpha=0.25)
-        self.p_zoom.setTitle(f"Zoom 0–{ZOOM_US:.0f} µs · promedio coherente ×{AVG_N}")
-        self.p_zoom.setLabel("left", "ADC (códigos)")
-        self.p_zoom.setLabel("bottom", "Tiempo", units="µs")
-        self.c_zoom_raw = self.p_zoom.plot(pen=pg.mkPen("#475569", width=1),
-                                           name="última")
-        self.c_zoom_avg = self.p_zoom.plot(pen=pg.mkPen("#facc15", width=2),
-                                           name="promedio")
-        lay.addWidget(self.p_zoom, stretch=1)
+        self.p_zoom.setTitle(
+            f"<b>Zoom de la región</b> · Ts = {TS_NS:.1f} ns ({FS_MHZ:.0f} MSPS) "
+            f"· cada punto = 1 muestra · promedio coherente de {AVG_N} ventanas")
+        self.p_zoom.setLabel("left", "Amplitud", units="mV")
+        self.p_zoom.setLabel("right", f"Código ADC ({BITS} bits · 0 mV = {MID})")
+        self.p_zoom.setLabel("bottom", "Tiempo desde el trigger", units="µs")
+        self.p_zoom.setLabel("top", "N.º de muestra")
+        self.p_zoom.showAxis("right")
+        self.p_zoom.showAxis("top")
+        self.p_zoom.addLegend(offset=(-10, 10), labelTextColor="#cbd5e1")
+        self.c_zoom_raw = self.p_zoom.plot(
+            pen=pg.mkPen("#475569", width=1),
+            symbol="o", symbolSize=5, symbolBrush="#94a3b8",
+            name="última ventana")
+        self.c_zoom_avg = self.p_zoom.plot(
+            pen=pg.mkPen("#facc15", width=2),
+            symbol="o", symbolSize=5, symbolBrush="#facc15",
+            name=f"promedio ×{AVG_N}")
+        lay.addWidget(self.p_zoom, stretch=2)
 
+        # ── Panel 3: histórico de min/max por ventana ─────────────────────────
+        self.p_hist = pg.PlotWidget()
+        self.p_hist.setBackground("#0b0f14")
+        self.p_hist.showGrid(x=True, y=True, alpha=0.25)
+        self.p_hist.setTitle(
+            f"<b>Histórico</b> · pico de cada ventana (últimos {HIST_S:.0f} s) "
+            "— estabilidad disparo a disparo")
+        self.p_hist.setLabel("left", "Amplitud", units="mV")
+        self.p_hist.setLabel("bottom", "Tiempo transcurrido", units="s")
+        self.p_hist.addLegend(offset=(-10, 10), labelTextColor="#cbd5e1")
+        self.c_hist_max = self.p_hist.plot(
+            pen=pg.mkPen("#f87171", width=1), name="máx por ventana")
+        self.c_hist_min = self.p_hist.plot(
+            pen=pg.mkPen("#60a5fa", width=1), name="mín por ventana")
+        lay.addWidget(self.p_hist, stretch=1)
+
+        # Estado
         self.buf = bytearray()
         self.ser = None
         self.avg = deque(maxlen=AVG_N)
+        hist_max = int(HIST_S * 40)
+        self.h_t = deque(maxlen=hist_max)
+        self.h_lo = deque(maxlen=hist_max)
+        self.h_hi = deque(maxlen=hist_max)
+        self.t0 = time.time()
         self.silent_since = None
+        self.last_frame_t = 0.0
 
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update)
         self.timer.start(POLL_MS)
+
+    def _sync_zoom_x(self):
+        lo, hi = self.region.getRegion()
+        self.p_zoom.setXRange(lo, hi, padding=0)
 
     def _status(self, t, c):
         self.status.setText(t)
@@ -143,6 +218,8 @@ class WindowView(QtWidgets.QWidget):
             del self.buf[: i + total]
 
         if frame is None:
+            if time.time() - self.last_frame_t < LIVE_HOLD_S:
+                return
             if self.silent_since is None:
                 self.silent_since = time.time()
             dt = time.time() - self.silent_since
@@ -150,24 +227,40 @@ class WindowView(QtWidgets.QWidget):
             return
 
         self.silent_since = None
-        data = (np.frombuffer(frame, dtype="<u2") & 0x03FF).astype(float)
-        self.c_full.setData(TIME_US, data)
+        self.last_frame_t = time.time()
+        codes = np.frombuffer(frame, dtype="<u2") & MASK
+        mv = code_to_mv(codes)
 
-        # Voltímetro: mediana de la ventana → voltios (robusto a picos del evento)
-        volts = (float(np.median(data)) - MID) * LSB_VOLTS
-        self.readout.setText(f"{volts:+.3f} V")
+        self.c_full.setData(TIME_US, mv)
 
-        z = data[:ZOOM_N]
-        self.avg.append(z)
+        self.avg.append(mv)
         avg = np.mean(self.avg, axis=0)
-        self.c_zoom_raw.setData(TIME_US[:ZOOM_N], z)
-        self.c_zoom_avg.setData(TIME_US[:ZOOM_N], avg)
-        # autoescala fina alrededor del promedio (señal de pocos códigos)
-        c = float(avg.mean())
-        span = max(8.0, float(avg.max() - avg.min()) * 1.5 + 4)
-        self.p_zoom.setYRange(c - span, c + span)
-        self._status(f"● LIVE  ventana  min/max={int(data.min())}/{int(data.max())}",
-                     "#4ade80")
+        self.c_zoom_raw.setData(TIME_US, mv)
+        self.c_zoom_avg.setData(TIME_US, avg)
+
+        # autoescala Y del zoom según la región visible (sobre el promedio)
+        lo, hi = self.region.getRegion()
+        m = (TIME_US >= lo) & (TIME_US <= hi)
+        if m.any():
+            seg = avg[m]
+            c = float(seg.mean())
+            span = max(20.0, float(seg.max() - seg.min()) * 0.6 + 10)
+            self.p_zoom.setYRange(c - span, c + span)
+
+        # histórico min/max (mV) por ventana
+        t = time.time() - self.t0
+        self.h_t.append(t)
+        self.h_lo.append(float(mv.min()))
+        self.h_hi.append(float(mv.max()))
+        ht = np.fromiter(self.h_t, float)
+        self.c_hist_max.setData(ht, np.fromiter(self.h_hi, float))
+        self.c_hist_min.setData(ht, np.fromiter(self.h_lo, float))
+        self.p_hist.setXRange(max(0, t - HIST_S), max(HIST_S, t), padding=0)
+
+        vmin, vmax = float(mv.min()), float(mv.max())
+        self.readout.setText(
+            f"min {vmin:+.0f} / max {vmax:+.0f} mV   ·   Vpp {vmax - vmin:.0f} mV")
+        self._status("● LIVE", "#4ade80")
 
 
 def main():
