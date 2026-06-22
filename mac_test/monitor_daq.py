@@ -18,6 +18,7 @@ Controles del gráfico (nativos de PyQtGraph):
     - Tecla 'A'              : autorrange
 """
 
+import os
 import sys
 import time
 
@@ -26,16 +27,23 @@ import pyqtgraph as pg
 import serial
 from PySide6 import QtCore, QtWidgets
 
+# Permite importar serial_helper cuando el script se ejecuta directamente.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from serial_helper import find_uart_port  # noqa: E402
+
 # --- Configuración ---
-SERIAL_PORT = "COM14"
-BAUD_RATE = 3_000_000
-SAMPLE_SIZE = 1350  # muestras por ráfaga
-FS_MHZ = 27.0
+SERIAL_PORT = find_uart_port()
+BAUD_RATE = 1_000_000  # debe coincidir con top.v (FW v0.4)
+SAMPLE_SIZE = 270  # muestras por ráfaga
+FS_MHZ = 54.0
 BIT_DEPTH = 10  # Fase 2: D11..D2 del AD9226
 BYTES_PER_SAMPLE = 2  # 10 bits empaquetados en uint16 LE
 FRAME_BYTES = SAMPLE_SIZE * BYTES_PER_SAMPLE  # = 2700 bytes/ráfaga
+FRAME_HEADER = b"\xAA\x55\xAA\x55"  # preámbulo de sync — debe coincidir con top.v
+VERSION_BYTES = 2                    # 2 bytes de versión big-endian tras el header
+EXPECTED_FW_VERSION = 0x0005          # firmware que esperamos correr (bump con cada release)
 C_TISSUE = 1540.0
-F_SENSOR = 2.0
+F_SENSOR = 2.5
 
 # --- Derivados ---
 PERIOD_US = 1.0 / FS_MHZ
@@ -68,23 +76,74 @@ class SerialReader(QtCore.QThread):
         self._running = True
 
     def run(self) -> None:
-        # ser.read(FRAME_BYTES) bloquea hasta tener los bytes o timeout.
-        # Como timeout=0.2 s en setup_serial(), el peor caso es 200 ms de
-        # bloqueo si el FPGA no dispara (no afecta a la UI: estamos en thread).
+        # Patrón acumulador + búsqueda de header: lee lo que esté disponible
+        # y busca el preámbulo FRAME_HEADER (0xAA 0x55 0xAA 0x55) que el FPGA
+        # inserta antes de cada ráfaga. Cualquier byte basura/desfasado se
+        # descarta automáticamente al no coincidir con el patrón.
+        MIN_EMIT_INTERVAL = 1.0 / 30  # 30 Hz max emits
+        HDR_LEN = len(FRAME_HEADER)
+        FRAME_TOTAL = HDR_LEN + VERSION_BYTES + FRAME_BYTES
+        MAX_BUFFER = 100_000  # cap de seguridad: si no aparece header, recortar
+        last_emit = 0.0
+        buffer = bytearray()
+        version_announced = False
+        print(f"[reader] thread iniciado, buscando header {FRAME_HEADER.hex()}")
+        loop_count = 0
         while self._running:
             try:
-                raw = self.ser.read(FRAME_BYTES)
-                if len(raw) < FRAME_BYTES:
-                    # Timeout sin datos suficientes: seguimos esperando.
-                    continue
-                # Drenado: si hay más frames ya esperando, salta al más reciente.
-                while self.ser.in_waiting >= FRAME_BYTES:
-                    raw = self.ser.read(FRAME_BYTES)
-                # 10 bits empaquetados en uint16 little-endian.
-                # Los 6 MSB son cero, así que no hace falta mask explícito,
-                # pero lo aplicamos por seguridad ante cualquier glitch.
-                data = np.frombuffer(raw, dtype="<u2") & 0x03FF
-                self.frame_ready.emit(data)
+                pending = self.ser.in_waiting
+                to_read = pending if pending > 0 else 1
+                chunk = self.ser.read(to_read)
+                if chunk:
+                    buffer.extend(chunk)
+
+                loop_count += 1
+                if loop_count % 5000 == 0:
+                    print(
+                        f"[reader] alive: buffer={len(buffer)} B, "
+                        f"in_waiting={self.ser.in_waiting}"
+                    )
+
+                # Cap de seguridad: si el header nunca aparece, no acumular sin fin.
+                if len(buffer) > MAX_BUFFER:
+                    # Mantener solo los últimos HDR_LEN-1 bytes por si el
+                    # header está parcial al final.
+                    del buffer[: -(HDR_LEN - 1)]
+
+                # Procesa todos los frames disponibles
+                while True:
+                    idx = buffer.find(FRAME_HEADER)
+                    if idx < 0:
+                        break  # no hay header completo aún
+                    # Descarta basura previa al header
+                    if idx > 0:
+                        del buffer[:idx]
+                    # ¿Hay header + version + frame completo?
+                    if len(buffer) < FRAME_TOTAL:
+                        break
+                    # Extrae versión y frame
+                    ver_hi = buffer[HDR_LEN]
+                    ver_lo = buffer[HDR_LEN + 1]
+                    fw_version = (ver_hi << 8) | ver_lo
+                    data_start = HDR_LEN + VERSION_BYTES
+                    frame_bytes = bytes(buffer[data_start : data_start + FRAME_BYTES])
+                    del buffer[:FRAME_TOTAL]
+
+                    if not version_announced:
+                        match = "OK" if fw_version == EXPECTED_FW_VERSION else "MISMATCH"
+                        print(
+                            f"[reader] FW_VERSION recibido: 0x{fw_version:04X} "
+                            f"(esperado 0x{EXPECTED_FW_VERSION:04X}) → {match}"
+                        )
+                        version_announced = True
+
+                    now = time.monotonic()
+                    if now - last_emit < MIN_EMIT_INTERVAL:
+                        continue
+                    last_emit = now
+
+                    data = np.frombuffer(frame_bytes, dtype="<u2") & 0x03FF
+                    self.frame_ready.emit(data)
             except serial.SerialException as e:
                 self.error.emit(str(e))
                 break
@@ -113,7 +172,11 @@ class DAQMonitor(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(central)
 
         # --- Panel izquierdo: gráfico ---
-        pg.setConfigOptions(antialias=True, useOpenGL=True)
+        # OpenGL deshabilitado en macOS (Apple deprecó OpenGL y el backend
+        # de PyQtGraph se cuelga en Sequoia/Sonoma). En Windows/Linux
+        # OpenGL sí acelera bien.
+        use_opengl = sys.platform != "darwin"
+        pg.setConfigOptions(antialias=True, useOpenGL=use_opengl)
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("#0f172a")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
@@ -291,7 +354,14 @@ class DAQMonitor(QtWidgets.QMainWindow):
 def main() -> None:
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.2)
+        # Bajar el latency timer del FTDI (default 16 ms en macOS/Linux).
+        # Sin esto el driver agrupa datos en chunks grandes y desalinea pares.
+        try:
+            ser.set_low_latency_mode(True)
+        except (NotImplementedError, OSError):
+            pass  # Windows ya respeta la config del Device Manager
         ser.reset_input_buffer()
+        ser.reset_output_buffer()
         print(f"Conectado a: {SERIAL_PORT}")
     except serial.SerialException as error:
         print(f"ERROR de puerto: {error}")

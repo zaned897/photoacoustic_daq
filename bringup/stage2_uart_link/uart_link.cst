@@ -1,0 +1,9 @@
+// Etapa 2 — enlace UART. Reloj, TX (pin 17), un LED heartbeat.
+IO_LOC "sys_clk" 52;
+IO_PORT "sys_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "uart_tx" 17;
+IO_PORT "uart_tx" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "led" 10;
+IO_PORT "led" IO_TYPE=LVCMOS18;

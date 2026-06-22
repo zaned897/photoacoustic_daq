@@ -1,0 +1,19 @@
+// Etapa 1 — detección de trigger. Reloj, dos entradas de trigger, tres LEDs.
+IO_LOC "sys_clk" 52;
+IO_PORT "sys_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// S2 — pull-up interno: reposo HIGH, flanco activo al soltar (LOW→HIGH)
+IO_LOC "trigger_manual" 3;
+IO_PORT "trigger_manual" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// Trigger externo (Arduino vía divisor) — pull-down: reposo LOW, flanco al subir
+IO_LOC "trigger_rpi" 77;
+IO_PORT "trigger_rpi" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+
+// LEDs de la placa (activo-bajo, LVCMOS18)
+IO_LOC "led_s2" 10;
+IO_PORT "led_s2" IO_TYPE=LVCMOS18;
+IO_LOC "led_rpi" 11;
+IO_PORT "led_rpi" IO_TYPE=LVCMOS18;
+IO_LOC "led_evt" 13;
+IO_PORT "led_evt" IO_TYPE=LVCMOS18;

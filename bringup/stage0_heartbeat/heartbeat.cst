@@ -1,0 +1,6 @@
+// Etapa 0 — heartbeat. Solo reloj y un LED.
+IO_LOC "sys_clk" 52;
+IO_PORT "sys_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "led" 10;
+IO_PORT "led" IO_TYPE=LVCMOS18;
